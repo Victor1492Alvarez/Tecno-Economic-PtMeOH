@@ -1,0 +1,9 @@
+from __future__ import annotations
+
+HOURS_PER_YEAR = 8760.0
+KG_PER_T = 1000.0
+MWH_PER_GWH = 1000.0
+W_PER_MW = 1_000_000.0
+KWH_PER_MWH = 1000.0
+H2_LHV_KWH_PER_KG = 33.33
+CO2_T_PER_T_MEOH_STOICH = 1.375
