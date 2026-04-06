@@ -20,8 +20,8 @@ class MultiSurrogateManager:
         runtime_count = 0
         for name, bundle in self.bundles.items():
             pred_df = bundle.predict([h2_flow_kg_per_h])
-            pred_val = float(pred_df["Prediction"].iloc) if "Prediction" in pred_df.columns else float(pred_df.iloc[0, 1])
-            std_val = float(pred_df["Predictive Std"].iloc) if "Predictive Std" in pred_df.columns else 0.0
+            pred_val = float(pred_df["Prediction"].iloc[0]) if "Prediction" in pred_df.columns else float(pred_df.iloc[0, 1])
+            std_val = float(pred_df["Predictive Std"].iloc[0]) if "Predictive Std" in pred_df.columns else 0.0
             in_domain = True
             if bundle.domain_min is not None and h2_flow_kg_per_h < float(bundle.domain_min):
                 in_domain = False
@@ -51,5 +51,3 @@ class MultiSurrogateManager:
         outputs["total_models_count"] = len(self.bundles)
         outputs["model_summary_df"] = pd.DataFrame(records)
         return outputs
-
-
