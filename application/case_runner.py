@@ -51,12 +51,18 @@ class CaseRunner:
             time_step_h=1.0,
         )
 
+    def run_simulation(self, case: CaseInputs):
+        return self.engine.run(case)
+
+    def run_optimization(self, case: CaseInputs):
+        return self.optimizer.run(case)
+
+    def run_sensitivities(self, case: CaseInputs):
+        return self.sensitivity.run(case)
+
     def run_all(self, case: CaseInputs) -> dict:
-        simulation = self.engine.run(case)
-        optimization = self.optimizer.run(case)
-        sensitivities = self.sensitivity.run(case)
         return {
-            "simulation": simulation,
-            "optimization": optimization,
-            "sensitivities": sensitivities,
+            "simulation": self.run_simulation(case),
+            "optimization": self.run_optimization(case),
+            "sensitivities": self.run_sensitivities(case),
         }
