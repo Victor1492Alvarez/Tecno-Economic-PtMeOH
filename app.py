@@ -48,8 +48,8 @@ def run_sensitivities(case):
     return runner.sensitivity.run(case)
 
 
-def install_model_zip(project_root: Path, model_name: str, uploaded_zip) -> dict:
-    target_dir = project_root / "models" / "packages" / model_name
+def install_model_zip(project_root: Path, library_name: str, model_name: str, uploaded_zip) -> dict:
+    target_dir = project_root / "models" / "packages" / library_name / model_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
     written_files: list[str] = []
@@ -74,12 +74,12 @@ def install_model_zip(project_root: Path, model_name: str, uploaded_zip) -> dict
         raise ValueError("No valid files were extracted from the ZIP archive.")
 
     return {
+        "library": library_name,
         "model_name": model_name,
         "target_dir": str(target_dir.relative_to(project_root)),
         "written_files": sorted(written_files),
         "written_count": len(written_files),
     }
-
 
 def render_upload_status():
     if st.session_state.get("upload_success_message"):
@@ -200,7 +200,7 @@ with st.sidebar:
                     st.rerun()
 
                 try:
-                    summary = install_model_zip(PROJECT_ROOT, target_model_name, uploaded_zip)
+                    summary = install_model_zip(PROJECT_ROOT,surrogate_library,target_model_name,uploaded_zip,)
                     st.session_state["upload_success_message"] = (
                         f"ZIP extracted into {summary['target_dir']} "
                         f"with {summary['written_count']} file(s): "
