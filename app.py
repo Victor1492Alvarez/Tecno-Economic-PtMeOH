@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
+from io import BytesIO
 import json
+from pathlib import Path
+from zipfile import BadZipFile, ZipFile
+
 import streamlit as st
 
 from application.case_runner import CaseRunner
@@ -18,8 +21,6 @@ st.caption(
     "Annual deterministic simulator, multi-surrogate PtMeOH response, "
     "techno-economics, and grid-search design exploration"
 )
-
-catalog_df = registry.discover_packages()
 
 
 def build_case_signature(payload: dict) -> str:
@@ -47,6 +48,48 @@ def run_sensitivities(case):
     return runner.sensitivity.run(case)
 
 
+def install_model_zip(project_root: Path, model_name: str, uploaded_zip) -> dict:
+    target_dir = project_root / "models" / "packages" / model_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    written_files: list[str] = []
+    zip_bytes = BytesIO(uploaded_zip.getvalue())
+
+    with ZipFile(zip_bytes) as zf:
+        members = [m for m in zf.infolist() if not m.is_dir()]
+        if not members:
+            raise ValueError("The ZIP file is empty or does not contain files.")
+
+        for member in members:
+            filename = Path(member.filename).name
+            if not filename:
+                continue
+
+            destination = target_dir / filename
+            with zf.open(member) as src, open(destination, "wb") as dst:
+                dst.write(src.read())
+            written_files.append(filename)
+
+    if not written_files:
+        raise ValueError("No valid files were extracted from the ZIP archive.")
+
+    return {
+        "model_name": model_name,
+        "target_dir": str(target_dir.relative_to(project_root)),
+        "written_files": sorted(written_files),
+        "written_count": len(written_files),
+    }
+
+
+def render_upload_status():
+    if st.session_state.get("upload_success_message"):
+        st.success(st.session_state["upload_success_message"])
+    if st.session_state.get("upload_error_message"):
+        st.error(st.session_state["upload_error_message"])
+
+
+catalog_df = registry.discover_packages()
+
 with st.sidebar:
     st.header("Case inputs")
     scenario_name = st.selectbox(
@@ -55,28 +98,49 @@ with st.sidebar:
         index=1,
     )
     renewable_peak_power_mw = st.slider(
-        "Renewable peak power [MW]", 50.0, 250.0, 145.0, 5.0
+        "Renewable peak power [MW]",
+        50.0,
+        250.0,
+        145.0,
+        5.0,
     )
     electrolyzer_power_mw = st.slider(
-        "Electrolyzer nominal power [MW]", 10.0, 180.0, 82.0, 2.0
+        "Electrolyzer nominal power [MW]",
+        10.0,
+        180.0,
+        82.0,
+        2.0,
     )
     module_count = st.slider("Electrolyzer module count [-]", 1, 12, 4, 1)
     storage_enabled = st.toggle("Enable H2 storage", value=True)
     storage_kg_h2 = st.slider(
-        "Usable H2 storage capacity [kg H2]", 0.0, 120000.0, 26000.0, 1000.0
+        "Usable H2 storage capacity [kg H2]",
+        0.0,
+        120000.0,
+        26000.0,
+        1000.0,
     )
     operating_mode = st.selectbox(
-        "PtMeOH operating mode", ["quasi_base_load", "flexible"]
+        "PtMeOH operating mode",
+        ["quasi_base_load", "flexible"],
     )
     surrogate_library = st.selectbox(
         "Surrogate model library",
         ["variable_h2_constant_co2", "variable_h2_variable_co2"],
     )
     target_h2_kg_per_h = st.slider(
-        "Target H2 feed to PtMeOH [kg/h]", 100.0, 4000.0, 1850.0, 50.0
+        "Target H2 feed to PtMeOH [kg/h]",
+        100.0,
+        4000.0,
+        1850.0,
+        50.0,
     )
     max_h2_feed_kg_per_h = st.slider(
-        "Maximum PtMeOH H2 intake [kg/h]", 200.0, 5000.0, 2200.0, 50.0
+        "Maximum PtMeOH H2 intake [kg/h]",
+        200.0,
+        5000.0,
+        2200.0,
+        50.0,
     )
 
     filtered_catalog = (
@@ -86,6 +150,8 @@ with st.sidebar:
     )
 
     st.subheader("Detected model bundles")
+    render_upload_status()
+
     if filtered_catalog.empty:
         st.warning("No package folders were detected yet for the selected library.")
     else:
@@ -96,6 +162,69 @@ with st.sidebar:
             use_container_width=True,
             hide_index=True,
         )
+
+    available_target_models = (
+        filtered_catalog["model_name"].tolist()
+        if not filtered_catalog.empty
+        else registry.get_models_by_library(surrogate_library)
+    )
+
+    with st.expander("Upload model ZIP", expanded=False):
+        st.caption(
+            "Upload one ZIP per model. The files will be extracted into "
+            "models/packages/<selected_model>/."
+        )
+
+        if available_target_models:
+            target_model_name = st.selectbox(
+                "Target model folder",
+                available_target_models,
+                key=f"target_model_{surrogate_library}",
+            )
+
+            uploaded_zip = st.file_uploader(
+                "Upload .zip package",
+                type=["zip"],
+                accept_multiple_files=False,
+                key=f"zip_uploader_{surrogate_library}_{target_model_name}",
+            )
+
+            if st.button("Upload selected ZIP", use_container_width=True):
+                st.session_state["upload_success_message"] = ""
+                st.session_state["upload_error_message"] = ""
+
+                if uploaded_zip is None:
+                    st.session_state["upload_error_message"] = (
+                        "Select a ZIP file before pressing upload."
+                    )
+                    st.rerun()
+
+                try:
+                    summary = install_model_zip(PROJECT_ROOT, target_model_name, uploaded_zip)
+                    st.session_state["upload_success_message"] = (
+                        f"ZIP extracted into {summary['target_dir']} "
+                        f"with {summary['written_count']} file(s): "
+                        f"{', '.join(summary['written_files'])}"
+                    )
+                    st.session_state["upload_error_message"] = ""
+                    st.rerun()
+                except BadZipFile:
+                    st.session_state["upload_success_message"] = ""
+                    st.session_state["upload_error_message"] = (
+                        "The uploaded file is not a valid ZIP archive."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.session_state["upload_success_message"] = ""
+                    st.session_state["upload_error_message"] = (
+                        f"Upload failed: {exc}"
+                    )
+                    st.rerun()
+        else:
+            st.warning(
+                "No target model names are available for this library. "
+                "Check models/catalog/catalog.json."
+            )
 
     confirm_bundle = st.checkbox(
         "I confirm that the detected model folders and file sets correspond to the intended surrogate library for this run.",
