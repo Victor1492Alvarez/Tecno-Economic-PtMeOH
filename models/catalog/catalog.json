@@ -1,20 +1,145 @@
 {
+  "libraries": [
+    "variable_h2_constant_co2",
+    "variable_h2_variable_co2"
+  ],
+  "model_order": [
+    "Model_Duty_RTR_Watt",
+    "Model_Duty_FEHE_Watt",
+    "Model_Duty_HX4_Watt",
+    "Model_Duty_HX3_Watt",
+    "Model_Duty_HX1_Watt",
+    "Model_Power_C3_Watt",
+    "Model_Power_C2_Watt",
+    "Model_Power_C1_Watt",
+    "Model_RECLP_CO2",
+    "Model_RECLP_H2",
+    "Model_RECLP_MeOH",
+    "Model_Purge_CO2",
+    "Model_Purge_H2",
+    "Model_Purge_MeOH",
+    "Model_Prod_MeOH"
+  ],
   "models": {
-    "Model_Duty_RTR_Watt": {"library": "variable_h2_constant_co2", "category": "thermal_duty", "unit": "W"},
-    "Model_Duty_FEHE_Watt": {"library": "variable_h2_constant_co2", "category": "thermal_duty", "unit": "W"},
-    "Model_Duty_HX4_Watt": {"library": "variable_h2_constant_co2", "category": "thermal_duty", "unit": "W"},
-    "Model_Duty_HX3_Watt": {"library": "variable_h2_constant_co2", "category": "thermal_duty", "unit": "W"},
-    "Model_Duty_HX1_Watt": {"library": "variable_h2_constant_co2", "category": "thermal_duty", "unit": "W"},
-    "Model_Power_C3_Watt": {"library": "variable_h2_constant_co2", "category": "electrical_load", "unit": "W"},
-    "Model_Power_C2_Watt": {"library": "variable_h2_constant_co2", "category": "electrical_load", "unit": "W"},
-    "Model_Power_C1_Watt": {"library": "variable_h2_constant_co2", "category": "electrical_load", "unit": "W"},
-    "Model_RECLP_CO2": {"library": "variable_h2_variable_co2", "category": "recycle_stream", "unit": "kmol/h_or_model_unit"},
-    "Model_RECLP_H2": {"library": "variable_h2_variable_co2", "category": "recycle_stream", "unit": "kmol/h_or_model_unit"},
-    "Model_RECLP_MeOH": {"library": "variable_h2_variable_co2", "category": "recycle_stream", "unit": "kmol/h_or_model_unit"},
-    "Model_Purge_CO2": {"library": "variable_h2_variable_co2", "category": "purge_stream", "unit": "kmol/h_or_model_unit"},
-    "Model_Purge_H2": {"library": "variable_h2_variable_co2", "category": "purge_stream", "unit": "kmol/h_or_model_unit"},
-    "Model_Purge_MeOH": {"library": "variable_h2_variable_co2", "category": "purge_stream", "unit": "kmol/h_or_model_unit"},
-    "Model_Prod_MeOH": {"library": "variable_h2_variable_co2", "category": "product_stream", "unit": "t/h_or_model_unit"}
+    "Model_Duty_RTR_Watt": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "thermal_duty",
+      "unit": "W"
+    },
+    "Model_Duty_FEHE_Watt": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "thermal_duty",
+      "unit": "W"
+    },
+    "Model_Duty_HX4_Watt": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "thermal_duty",
+      "unit": "W"
+    },
+    "Model_Duty_HX3_Watt": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "thermal_duty",
+      "unit": "W"
+    },
+    "Model_Duty_HX1_Watt": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "thermal_duty",
+      "unit": "W"
+    },
+    "Model_Power_C3_Watt": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "electrical_load",
+      "unit": "W"
+    },
+    "Model_Power_C2_Watt": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "electrical_load",
+      "unit": "W"
+    },
+    "Model_Power_C1_Watt": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "electrical_load",
+      "unit": "W"
+    },
+    "Model_RECLP_CO2": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "recycle_stream",
+      "unit": "kmol/h_or_model_unit"
+    },
+    "Model_RECLP_H2": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "recycle_stream",
+      "unit": "kmol/h_or_model_unit"
+    },
+    "Model_RECLP_MeOH": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "recycle_stream",
+      "unit": "kmol/h_or_model_unit"
+    },
+    "Model_Purge_CO2": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "purge_stream",
+      "unit": "kmol/h_or_model_unit"
+    },
+    "Model_Purge_H2": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "purge_stream",
+      "unit": "kmol/h_or_model_unit"
+    },
+    "Model_Purge_MeOH": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "purge_stream",
+      "unit": "kmol/h_or_model_unit"
+    },
+    "Model_Prod_MeOH": {
+      "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2"
+      ],
+      "category": "product_stream",
+      "unit": "t/h_or_model_unit"
+    }
   }
 }
-
