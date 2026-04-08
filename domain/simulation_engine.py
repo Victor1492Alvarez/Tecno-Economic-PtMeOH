@@ -27,6 +27,108 @@ class SimulationEngine:
             )
         return self._surrogate_cache[library_name]
 
+    def _extract_power_breakdown(self, model_summary_df: pd.DataFrame) -> dict[str, float]:
+        def model_power_w(model_name: str) -> float:
+            if model_summary_df.empty:
+                return 0.0
+            subset = model_summary_df.loc[model_summary_df["model_name"] == model_name, "prediction"]
+            if subset.empty:
+                return 0.0
+            return max(float(subset.iloc[0]), 0.0)
+
+        c1_w = model_power_w("Model_Power_C1_Watt")
+        c2_w = model_power_w("Model_Power_C2_Watt")
+        c3_w = model_power_w("Model_Power_C3_Watt")
+        total_w = c1_w + c2_w + c3_w
+
+        return {
+            "power_c1_w": c1_w,
+            "power_c2_w": c2_w,
+            "power_c3_w": c3_w,
+            "total_downstream_power_w": total_w,
+            "power_c1_mw": c1_w / 1_000_000.0,
+            "power_c2_mw": c2_w / 1_000_000.0,
+            "power_c3_mw": c3_w / 1_000_000.0,
+            "total_downstream_power_mw": total_w / 1_000_000.0,
+        }
+
+    def _dispatch_h2(
+        self,
+        case: CaseInputs,
+        storage: H2StorageModel,
+        starting_soc_kg_h2: float,
+        produced_h2_kg_per_h: float,
+    ) -> dict[str, float]:
+        capacity = max(storage.capacity_kg_h2, 0.0)
+        max_charge = max(storage.max_charge_kg_per_h, 0.0)
+        max_discharge = max(storage.max_discharge_kg_per_h, 0.0)
+
+        tank_in = 0.0
+        tank_out = 0.0
+        tank_full = 0
+        tank_empty = 0
+        curtailment_h2_kg = 0.0
+        new_soc = starting_soc_kg_h2
+
+        target_h2 = min(
+            case.ptmeoh.target_h2_feed_kg_per_h,
+            case.ptmeoh.max_h2_feed_kg_per_h,
+        )
+
+        if case.ptmeoh.operating_mode == "quasi_base_load":
+            direct_h2 = min(produced_h2_kg_per_h, target_h2)
+            shortage = max(target_h2 - direct_h2, 0.0)
+            excess = max(produced_h2_kg_per_h - direct_h2, 0.0)
+
+            if case.storage.enabled:
+                tank_out = min(shortage, new_soc, max_discharge)
+                new_soc -= tank_out
+                room = max(capacity - new_soc, 0.0)
+                tank_in = min(excess, room, max_charge)
+                new_soc += tank_in
+                curtailment_h2_kg = max(excess - tank_in, 0.0)
+                tank_empty = int(shortage > tank_out + 1e-9 and new_soc <= 1e-9)
+                tank_full = int(excess > tank_in + 1e-9 and capacity - new_soc <= 1e-9)
+            else:
+                curtailment_h2_kg = excess
+
+            actual_h2 = min(direct_h2 + tank_out, case.ptmeoh.max_h2_feed_kg_per_h)
+
+        else:
+            raw_available = min(produced_h2_kg_per_h, case.ptmeoh.max_h2_feed_kg_per_h)
+
+            if case.storage.enabled and raw_available < target_h2:
+                demand_from_tank = target_h2 - raw_available
+                tank_out = min(demand_from_tank, new_soc, max_discharge)
+                new_soc -= tank_out
+                tank_empty = int(demand_from_tank > tank_out + 1e-9 and new_soc <= 1e-9)
+                actual_h2 = min(raw_available + tank_out, case.ptmeoh.max_h2_feed_kg_per_h)
+            else:
+                actual_h2 = raw_available
+
+            if case.storage.enabled and raw_available > target_h2:
+                excess = raw_available - target_h2
+                room = max(capacity - new_soc, 0.0)
+                tank_in = min(excess, room, max_charge)
+                new_soc += tank_in
+                curtailment_h2_kg = max(excess - tank_in, 0.0)
+                tank_full = int(excess > tank_in + 1e-9 and capacity - new_soc <= 1e-9)
+                actual_h2 = min(target_h2, case.ptmeoh.max_h2_feed_kg_per_h)
+
+        unmet_h2 = max(case.ptmeoh.target_h2_feed_kg_per_h - actual_h2, 0.0)
+
+        return {
+            "target_h2_kg_per_h": target_h2,
+            "actual_h2_kg_per_h": actual_h2,
+            "unmet_h2_kg_per_h": unmet_h2,
+            "tank_in_kg_per_h": tank_in,
+            "tank_out_kg_per_h": tank_out,
+            "tank_full_event": tank_full,
+            "tank_empty_event": tank_empty,
+            "curtailed_h2_kg_per_h": curtailment_h2_kg,
+            "new_soc_kg_h2": new_soc,
+        }
+
     def run(self, case: CaseInputs) -> SimulationArtifacts:
         warnings = validate_case_inputs(case)
 
@@ -52,128 +154,110 @@ class SimulationEngine:
         for _, row in case.renewable_profile.iterrows():
             renewable_power_mw = float(row["renewable_power_mw"])
             timestamp = row.get("timestamp")
-            el_state = el.step(renewable_power_mw)
+            starting_soc = float(storage.soc_kg_h2)
 
-            tank_in = 0.0
-            tank_out = 0.0
-            tank_full = 0
-            tank_empty = 0
-            curtailment_h2_kg = 0.0
+            downstream_aux_power_guess_mw = 0.0
+            final_el_state = None
+            final_dispatch = None
+            final_surrogate_outputs = None
+            final_model_summary_df = pd.DataFrame()
+            final_power_breakdown = None
+            methanol_t_per_h = 0.0
 
-            if case.ptmeoh.operating_mode == "quasi_base_load":
-                target_h2 = min(
-                    case.ptmeoh.target_h2_feed_kg_per_h,
-                    case.ptmeoh.max_h2_feed_kg_per_h,
-                )
-                direct_h2 = min(el_state.h2_produced_kg_per_h, target_h2)
-                shortage = max(target_h2 - direct_h2, 0.0)
-                excess = max(el_state.h2_produced_kg_per_h - direct_h2, 0.0)
-
-                if case.storage.enabled:
-                    discharge = storage.discharge(shortage)
-                    charge = storage.charge(excess)
-                    tank_out = discharge.tank_out_kg_per_h
-                    tank_in = charge.tank_in_kg_per_h
-                    tank_empty = discharge.tank_empty_event
-                    tank_full = charge.tank_full_event
-                    curtailment_h2_kg = max(excess - tank_in, 0.0)
-                else:
-                    curtailment_h2_kg = excess
-
-                actual_h2 = min(
-                    direct_h2 + tank_out,
-                    case.ptmeoh.max_h2_feed_kg_per_h,
+            for _ in range(6):
+                power_available_for_electrolyzer_mw = max(
+                    renewable_power_mw - downstream_aux_power_guess_mw,
+                    0.0,
                 )
 
-            else:
-                raw_available = min(
-                    el_state.h2_produced_kg_per_h,
-                    case.ptmeoh.max_h2_feed_kg_per_h,
+                el_state = el.step(power_available_for_electrolyzer_mw)
+
+                dispatch = self._dispatch_h2(
+                    case=case,
+                    storage=storage,
+                    starting_soc_kg_h2=starting_soc,
+                    produced_h2_kg_per_h=el_state.h2_produced_kg_per_h,
                 )
-                target_h2 = min(
-                    case.ptmeoh.target_h2_feed_kg_per_h,
-                    case.ptmeoh.max_h2_feed_kg_per_h,
+
+                surrogate_outputs = surrogates.predict_all(dispatch["actual_h2_kg_per_h"])
+                this_model_summary_df = surrogate_outputs["model_summary_df"]
+
+                methanol_t_per_h = max(
+                    dispatch["actual_h2_kg_per_h"] / KG_PER_T * case.ptmeoh.methanol_yield_t_meoh_per_t_h2,
+                    0.0,
                 )
-
-                if case.storage.enabled and raw_available < target_h2:
-                    discharge = storage.discharge(target_h2 - raw_available)
-                    tank_out = discharge.tank_out_kg_per_h
-                    tank_empty = discharge.tank_empty_event
-                    actual_h2 = min(
-                        raw_available + tank_out,
-                        case.ptmeoh.max_h2_feed_kg_per_h,
-                    )
-                else:
-                    actual_h2 = raw_available
-
-                if case.storage.enabled and raw_available > target_h2:
-                    charge = storage.charge(raw_available - target_h2)
-                    tank_in = charge.tank_in_kg_per_h
-                    tank_full = charge.tank_full_event
-                    curtailment_h2_kg = max(raw_available - target_h2 - tank_in, 0.0)
-                    actual_h2 = min(target_h2, case.ptmeoh.max_h2_feed_kg_per_h)
-
-            unmet_h2 = max(case.ptmeoh.target_h2_feed_kg_per_h - actual_h2, 0.0)
-            surrogate_outputs = surrogates.predict_all(actual_h2)
-            model_summary_df = surrogate_outputs["model_summary_df"]
-
-            methanol_t_per_h = max(
-                actual_h2 / KG_PER_T * case.ptmeoh.methanol_yield_t_meoh_per_t_h2,
-                0.0,
-            )
-
-            if "Model_Prod_MeOH" in model_summary_df["model_name"].tolist():
-                prod_row = model_summary_df.loc[
-                    model_summary_df["model_name"] == "Model_Prod_MeOH"
-                ]
-                if not prod_row.empty:
-                    methanol_t_per_h = max(float(prod_row["prediction"].iloc[0]), 0.0)
-
-            aux_power_from_models_w = (
-                float(
-                    model_summary_df.loc[
-                        model_summary_df["model_name"].str.contains(
-                            "Model_Power_",
-                            regex=False,
-                        ),
-                        "prediction",
+                if "Model_Prod_MeOH" in this_model_summary_df["model_name"].tolist():
+                    prod_row = this_model_summary_df.loc[
+                        this_model_summary_df["model_name"] == "Model_Prod_MeOH"
                     ]
-                    .clip(lower=0)
-                    .sum()
-                )
-                if not model_summary_df.empty
-                else 0.0
+                    if not prod_row.empty:
+                        methanol_t_per_h = max(float(prod_row["prediction"].iloc[0]), 0.0)
+
+                power_breakdown = self._extract_power_breakdown(this_model_summary_df)
+                new_guess_mw = power_breakdown["total_downstream_power_mw"]
+
+                final_el_state = el_state
+                final_dispatch = dispatch
+                final_surrogate_outputs = surrogate_outputs
+                final_model_summary_df = this_model_summary_df
+                final_power_breakdown = power_breakdown
+
+                if abs(new_guess_mw - downstream_aux_power_guess_mw) <= 1e-6:
+                    break
+
+                downstream_aux_power_guess_mw = new_guess_mw
+
+            storage.soc_kg_h2 = final_dispatch["new_soc_kg_h2"]
+            model_summary_df = final_model_summary_df
+
+            total_internal_power_mw = (
+                final_el_state.power_to_electrolyzer_mw
+                + final_power_breakdown["total_downstream_power_mw"]
             )
+            renewable_used_mw = min(total_internal_power_mw, renewable_power_mw)
+            curtailed_power_mw = max(renewable_power_mw - renewable_used_mw, 0.0)
+            power_deficit_mw = max(total_internal_power_mw - renewable_power_mw, 0.0)
 
             record = {
                 "timestamp": timestamp,
                 "renewable_power_mw": renewable_power_mw,
-                "power_to_electrolyzer_mw": el_state.power_to_electrolyzer_mw,
-                "module_count_online": el_state.module_count_online,
-                "h2_produced_kg_per_h": el_state.h2_produced_kg_per_h,
-                "curtailed_power_mw": el_state.curtailed_power_mw,
-                "curtailed_h2_kg_per_h": curtailment_h2_kg,
+                "renewable_used_mw": renewable_used_mw,
+                "power_to_electrolyzer_mw": final_el_state.power_to_electrolyzer_mw,
+                "downstream_aux_power_mw": final_power_breakdown["total_downstream_power_mw"],
+                "total_internal_power_mw": total_internal_power_mw,
+                "power_deficit_mw": power_deficit_mw,
+                "module_count_online": final_el_state.module_count_online,
+                "h2_produced_kg_per_h": final_el_state.h2_produced_kg_per_h,
+                "curtailed_power_mw": curtailed_power_mw,
+                "curtailed_h2_kg_per_h": final_dispatch["curtailed_h2_kg_per_h"],
                 "tank_soc_kg_h2": storage.soc_kg_h2,
-                "tank_in_kg_per_h": tank_in,
-                "tank_out_kg_per_h": tank_out,
-                "tank_full_event": tank_full,
-                "tank_empty_event": tank_empty,
-                "h2_to_ptmeoh_kg_per_h": actual_h2,
-                "unmet_h2_kg_per_h": unmet_h2,
+                "tank_in_kg_per_h": final_dispatch["tank_in_kg_per_h"],
+                "tank_out_kg_per_h": final_dispatch["tank_out_kg_per_h"],
+                "tank_full_event": final_dispatch["tank_full_event"],
+                "tank_empty_event": final_dispatch["tank_empty_event"],
+                "h2_target_to_ptmeoh_kg_per_h": final_dispatch["target_h2_kg_per_h"],
+                "h2_to_ptmeoh_kg_per_h": final_dispatch["actual_h2_kg_per_h"],
+                "unmet_h2_kg_per_h": final_dispatch["unmet_h2_kg_per_h"],
                 "methanol_t_per_h": methanol_t_per_h,
-                "aux_power_from_models_w": aux_power_from_models_w,
+                "power_c1_w": final_power_breakdown["power_c1_w"],
+                "power_c2_w": final_power_breakdown["power_c2_w"],
+                "power_c3_w": final_power_breakdown["power_c3_w"],
+                "power_c1_mw": final_power_breakdown["power_c1_mw"],
+                "power_c2_mw": final_power_breakdown["power_c2_mw"],
+                "power_c3_mw": final_power_breakdown["power_c3_mw"],
+                "aux_power_from_models_w": final_power_breakdown["total_downstream_power_w"],
                 "surrogate_all_models_in_domain": int(
-                    bool(surrogate_outputs["all_models_in_domain"])
+                    bool(final_surrogate_outputs["all_models_in_domain"])
                 ),
                 "surrogate_runtime_models_count": int(
-                    surrogate_outputs["runtime_models_count"]
+                    final_surrogate_outputs["runtime_models_count"]
                 ),
                 "surrogate_total_models_count": int(
-                    surrogate_outputs["total_models_count"]
+                    final_surrogate_outputs["total_models_count"]
                 ),
             }
 
-            for key, value in surrogate_outputs.items():
+            for key, value in final_surrogate_outputs.items():
                 if key == "model_summary_df":
                     continue
                 if key not in record:
@@ -197,7 +281,7 @@ class SimulationEngine:
                 / max(case.ptmeoh.max_h2_feed_kg_per_h, 1e-9)
             ),
             "renewable_utilization_fraction": float(
-                df["power_to_electrolyzer_mw"].sum()
+                df["renewable_used_mw"].sum()
                 / max(df["renewable_power_mw"].sum(), 1e-9)
             ),
             "h2_not_supplied_t": float(
@@ -207,6 +291,8 @@ class SimulationEngine:
                 df["curtailed_power_mw"].sum()
                 / max(df["renewable_power_mw"].sum(), 1e-9)
             ),
+            "annual_total_electricity_mwh": econ["annual_power_mwh"],
+            "annual_downstream_electricity_mwh": econ["annual_downstream_power_mwh"],
             "total_capex_usd": econ["total_capex_usd"],
             "annual_opex_usd": econ["annual_opex_usd"],
             "lcoh_usd_per_t_h2": econ["lcoh_usd_per_t_h2"],
@@ -252,6 +338,10 @@ class SimulationEngine:
         if kpis["runtime_models_fraction"] < 1.0:
             warnings.append(
                 "At least one surrogate model package is incomplete; fallback mock predictions are being used for missing runtime artifacts."
+            )
+        if float(df["power_deficit_mw"].max()) > 1e-6:
+            warnings.append(
+                "Downstream auxiliary electrical demand exceeded the renewable supply in at least one timestep; review renewable sizing and PtMeOH operating limits."
             )
 
         surrogate_info = {
