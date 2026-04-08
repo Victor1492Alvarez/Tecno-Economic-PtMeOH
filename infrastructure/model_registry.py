@@ -67,26 +67,55 @@ class ModelRegistry:
         extras = [m for m in discovered if m not in ordered]
         return ordered + extras
 
-    def package_files(self, model_name: str, library_name: str) -> dict[str, Path]:
+    def _first_match(self, pkg: Path, patterns: list[str]) -> Path | None:
+        for pattern in patterns:
+            matches = sorted(pkg.glob(pattern))
+            if matches:
+                return matches[0]
+        return None
+
+    def package_files(self, model_name: str, library_name: str) -> dict[str, Path | None]:
         pkg = self.package_path(model_name, library_name)
+
+        if not pkg.exists():
+            return {
+                "joblib": None,
+                "py": None,
+                "txt": None,
+                "metadata": None,
+                "parameters": None,
+                "consolidated_report": None,
+                "training_report": None,
+            }
+
         return {
-            "joblib": pkg / f"{model_name}.joblib",
-            "py": pkg / f"{model_name}.py",
-            "txt": pkg / f"{model_name}.txt",
-            "metadata": pkg / "metadata.json",
-            "parameters": pkg / "model_parameters.xlsx",
-            "consolidated_report": pkg / "consolidated_model_report.pdf",
-            "training_report": pkg / "training_validation_report.pdf",
+            "joblib": self._first_match(pkg, [f"{model_name}.joblib", "*.joblib"]),
+            "py": self._first_match(pkg, [f"{model_name}.py", "*.py"]),
+            "txt": self._first_match(pkg, [f"{model_name}.txt", "*.txt"]),
+            "metadata": self._first_match(pkg, ["metadata.json", "*.json"]),
+            "parameters": self._first_match(pkg, ["model_parameters.xlsx", "*.xlsx", "*.xls"]),
+            "consolidated_report": self._first_match(
+                pkg,
+                ["consolidated_model_report.pdf", "*consolidated*.pdf", "*.pdf"],
+            ),
+            "training_report": self._first_match(
+                pkg,
+                ["training_validation_report.pdf", "*training*.pdf", "*.pdf"],
+            ),
         }
 
     def inspect_package(self, model_name: str, library_name: str) -> dict[str, Any]:
+        pkg = self.package_path(model_name, library_name)
         files = self.package_files(model_name, library_name)
-        file_status = {k: v.exists() for k, v in files.items()}
+        file_status = {k: (v is not None and v.exists()) for k, v in files.items()}
+        file_names = {k: (v.name if v is not None else "") for k, v in files.items()}
+
         return {
             "model_name": model_name,
             "library": library_name,
-            "folder_exists": self.package_path(model_name, library_name).exists(),
+            "folder_exists": pkg.exists(),
             "file_status": file_status,
+            "file_names": file_names,
             "ready_for_runtime": file_status["joblib"] and file_status["py"],
             "ready_for_qa": all(
                 file_status[k]
@@ -115,10 +144,9 @@ class ModelRegistry:
                         "joblib_found": inspected["file_status"]["joblib"],
                         "py_found": inspected["file_status"]["py"],
                         "txt_found": inspected["file_status"]["txt"],
-                        "metadata_found": inspected["file_status"]["metadata"],
-                        "parameters_found": inspected["file_status"]["parameters"],
-                        "consolidated_report_found": inspected["file_status"]["consolidated_report"],
-                        "training_report_found": inspected["file_status"]["training_report"],
+                        "joblib_file": inspected["file_names"]["joblib"],
+                        "py_file": inspected["file_names"]["py"],
+                        "txt_file": inspected["file_names"]["txt"],
                         "ready_for_runtime": inspected["ready_for_runtime"],
                         "ready_for_qa": inspected["ready_for_qa"],
                         "missing_files": ", ".join(inspected["missing_files"]),
@@ -129,7 +157,7 @@ class ModelRegistry:
 
     def read_model_parameters(self, model_name: str, library_name: str) -> dict:
         path = self.package_files(model_name, library_name)["parameters"]
-        if not path.exists():
+        if path is None or not path.exists():
             return {}
 
         xl = pd.ExcelFile(path)
