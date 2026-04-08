@@ -137,16 +137,20 @@ def load_surrogate_bundle(project_root: Path, model_name: str, library_name: str
     parameters = registry.read_model_parameters(model_name, library_name)
 
     metadata = {}
-    if files["metadata"].exists():
-        metadata = json.loads(files["metadata"].read_text(encoding="utf-8"))
+    metadata_path = files["metadata"]
+    if metadata_path is not None and metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 
     predictor = None
-    if files["joblib"].exists():
-        predictor = RuntimeJoblibPredictor(files["joblib"])
-    elif files["py"].exists():
+    joblib_path = files["joblib"]
+    py_path = files["py"]
+
+    if joblib_path is not None and joblib_path.exists():
+        predictor = RuntimeJoblibPredictor(joblib_path)
+    elif py_path is not None and py_path.exists():
         try:
             predictor = PythonWrapperPredictor(
-                files["py"],
+                py_path,
                 module_key=f"{library_name}__{model_name}",
             )
         except Exception:
