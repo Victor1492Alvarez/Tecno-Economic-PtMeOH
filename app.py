@@ -550,7 +550,7 @@ with st.sidebar:
                     st.rerun()
 
     st.toggle(
-        "Persist uploaded model ZIPs and renewable profile for future iterations",
+        "Save uploaded model ZIPs and renewable profile for future iterations",
         value=st.session_state.get("persist_assets", True),
         key="persist_assets",
         help="When enabled, uploaded model archives and normalized renewable profiles are written to disk under user_data/ for reuse in later sessions.",
