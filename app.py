@@ -502,7 +502,7 @@ with st.sidebar:
 
     model_names = registry.get_models_by_library(surrogate_library)
 
-    with st.expander("Upload Surrogate Model folder ZIP", expanded=False):
+    with st.expander("Upload Surrogate Model", expanded=False):
         st.caption(
             "Upload one ZIP per model. The archive is flattened into "
             "models/packages/<library>/<model_name>/ so the runtime can find .joblib, .py and .txt directly."
