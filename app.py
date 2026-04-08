@@ -250,11 +250,7 @@ active_profile_name = st.session_state.get("renewable_profile_name", "default_sy
 with st.sidebar:
     st.header("Case inputs")
 
-    persist_assets = st.toggle(
-        "Persist uploaded model ZIPs and renewable profile for future iterations",
-        value=True,
-        help="When enabled, uploaded model archives and normalized renewable profiles are written to disk under user_data/ for reuse in later sessions.",
-    )
+    persist_assets_value = st.session_state.get("persist_assets", True)
 
     library_names = registry.get_library_names() or [
         "variable_h2_constant_co2",
@@ -370,6 +366,8 @@ with st.sidebar:
             step=1.0,
             format="%.3f",
         )
+        st.session_state["renewable_profile_df"] = None
+        st.session_state["renewable_profile_name"] = "default_synthetic_profile"
         active_profile_df = None
         active_profile_name = "default_synthetic_profile"
 
@@ -426,7 +424,7 @@ with st.sidebar:
                         uploaded_profile_file,
                         normalized_profile,
                         uploaded_profile_file.name,
-                        persist_assets,
+                        persist_assets_value,
                     )
                     flash_message(
                         "success",
@@ -534,7 +532,7 @@ with st.sidebar:
                         surrogate_library,
                         target_model_name,
                         uploaded_model_zip,
-                        persist_assets,
+                        st.session_state.get("persist_assets", True),
                     )
                     flash_message(
                         "success",
@@ -550,6 +548,13 @@ with st.sidebar:
                 except Exception as exc:
                     flash_message("error", f"Upload failed: {exc}")
                     st.rerun()
+
+    st.toggle(
+        "Persist uploaded model ZIPs and renewable profile for future iterations",
+        value=st.session_state.get("persist_assets", True),
+        key="persist_assets",
+        help="When enabled, uploaded model archives and normalized renewable profiles are written to disk under user_data/ for reuse in later sessions.",
+    )
 
     confirm_bundle = st.checkbox(
         "I confirm that the detected model folders and file sets correspond to the intended surrogate library for this run.",
