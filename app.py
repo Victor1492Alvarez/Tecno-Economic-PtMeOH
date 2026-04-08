@@ -184,45 +184,6 @@ def load_saved_profile(path: Path) -> pd.DataFrame:
     return df
 
 
-def expected_bundle_status(project_root: Path, library_name: str, model_names: list[str]) -> pd.DataFrame:
-    rows = []
-    for model_name in model_names:
-        model_dir = project_root / "models" / "packages" / library_name / model_name
-        expected = {
-            "joblib": model_dir / f"{model_name}.joblib",
-            "py": model_dir / f"{model_name}.py",
-            "txt": model_dir / f"{model_name}.txt",
-            "metadata": model_dir / "metadata.json",
-            "parameters": model_dir / "model_parameters.xlsx",
-            "consolidated_report": model_dir / "consolidated_model_report.pdf",
-            "training_report": model_dir / "training_validation_report.pdf",
-        }
-        status = {key: path.exists() for key, path in expected.items()}
-        rows.append(
-            {
-                "library": library_name,
-                "model_name": model_name,
-                "folder_exists": model_dir.exists(),
-                "joblib_found": status["joblib"],
-                "py_found": status["py"],
-                "txt_found": status["txt"],
-                "metadata_found": status["metadata"],
-                "parameters_found": status["parameters"],
-                "consolidated_report_found": status["consolidated_report"],
-                "training_report_found": status["training_report"],
-                "ready_for_runtime": status["joblib"] and status["py"],
-                "ready_for_qa": (
-                    status["metadata"]
-                    and status["parameters"]
-                    and status["consolidated_report"]
-                    and status["training_report"]
-                ),
-                "missing_files": ", ".join([name for name, ok in status.items() if not ok]),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
 def install_model_zip(
     project_root: Path,
     library_name: str,
@@ -295,6 +256,11 @@ with st.sidebar:
         help="When enabled, uploaded model archives and normalized renewable profiles are written to disk under user_data/ for reuse in later sessions.",
     )
 
+    library_names = registry.get_library_names() or [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2",
+    ]
+
     scenario_name = st.selectbox(
         "Techno-economic scenario",
         ["optimistic", "moderate", "pessimistic"],
@@ -346,7 +312,8 @@ with st.sidebar:
 
     surrogate_library = st.selectbox(
         "Surrogate model library",
-        ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+        library_names,
+        index=0,
     )
 
     target_h2_kg_per_h = st.number_input(
@@ -509,14 +476,18 @@ with st.sidebar:
 
     st.subheader("Detected model bundles")
 
-    model_names = registry.get_models_by_library(surrogate_library)
-    bundle_df = expected_bundle_status(PROJECT_ROOT, surrogate_library, model_names)
+    catalog_df = registry.discover_packages()
+    filtered_catalog = (
+        catalog_df[catalog_df["library"] == surrogate_library].copy()
+        if not catalog_df.empty
+        else pd.DataFrame()
+    )
 
-    if bundle_df.empty:
+    if filtered_catalog.empty:
         st.warning("No configured model names were found for the selected surrogate library.")
     else:
         st.dataframe(
-            bundle_df[
+            filtered_catalog[
                 [
                     "model_name",
                     "joblib_found",
@@ -530,6 +501,8 @@ with st.sidebar:
             use_container_width=True,
             hide_index=True,
         )
+
+    model_names = registry.get_models_by_library(surrogate_library)
 
     with st.expander("Upload model ZIP", expanded=False):
         st.caption(
@@ -580,7 +553,7 @@ with st.sidebar:
 
     confirm_bundle = st.checkbox(
         "I confirm that the detected model folders and file sets correspond to the intended surrogate library for this run.",
-        value=not bundle_df.empty,
+        value=not filtered_catalog.empty,
     )
 
 if not confirm_bundle:
@@ -681,7 +654,7 @@ with tab1:
 
     with c2:
         st.subheader("Model bundle checklist")
-        st.dataframe(bundle_df, use_container_width=True, hide_index=True)
+        st.dataframe(filtered_catalog, use_container_width=True, hide_index=True)
 
     with c3:
         st.subheader("Renewable profile summary")
