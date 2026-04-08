@@ -60,7 +60,9 @@ class CaseRunner:
                     renewable_profile = renewable_profile.reset_index()
                 else:
                     renewable_profile = renewable_profile.reset_index(drop=False)
-                    renewable_profile = renewable_profile.rename(columns={renewable_profile.columns[0]: "timestamp"})
+                    renewable_profile = renewable_profile.rename(
+                        columns={renewable_profile.columns[0]: "timestamp"}
+                    )
 
             if "renewable_power_mw" not in renewable_profile.columns:
                 raise ValueError(
