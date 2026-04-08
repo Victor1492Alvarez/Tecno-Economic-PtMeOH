@@ -502,7 +502,7 @@ with st.sidebar:
 
     model_names = registry.get_models_by_library(surrogate_library)
 
-    with st.expander("Upload model ZIP", expanded=False):
+    with st.expander("Upload Surrogate Model folder ZIP", expanded=False):
         st.caption(
             "Upload one ZIP per model. The archive is flattened into "
             "models/packages/<library>/<model_name>/ so the runtime can find .joblib, .py and .txt directly."
@@ -521,7 +521,7 @@ with st.sidebar:
                 key=f"zip_uploader_{surrogate_library}_{target_model_name}",
             )
 
-            if st.button("Upload selected model ZIP", use_container_width=True):
+            if st.button("Asign selected model ZIP to model bundle", use_container_width=True):
                 if uploaded_model_zip is None:
                     flash_message("error", "Select a ZIP file before pressing upload.")
                     st.rerun()
