@@ -510,7 +510,7 @@ with st.sidebar:
 
         if model_names:
             target_model_name = st.selectbox(
-                "Target model folder",
+                "Target model bundle",
                 model_names,
                 key=f"target_model_{surrogate_library}",
             )
