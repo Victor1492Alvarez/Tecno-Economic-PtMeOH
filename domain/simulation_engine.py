@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 import pandas as pd
 
 from domain.data_models import CaseInputs, SimulationArtifacts
@@ -12,6 +13,8 @@ from domain.validators import validate_case_inputs
 from domain.units import KG_PER_T
 from infrastructure.logging_utils import configure_logger
 
+ProgressCallback = Callable[[str, int, int], None] | None
+
 
 class SimulationEngine:
     def __init__(self, project_root: Path):
@@ -21,11 +24,22 @@ class SimulationEngine:
 
     def _get_surrogates(self, library_name: str) -> MultiSurrogateManager:
         if library_name not in self._surrogate_cache:
+            self.logger.info("Loading surrogate library '%s'", library_name)
             self._surrogate_cache[library_name] = MultiSurrogateManager(
                 self.project_root,
                 library_name,
             )
         return self._surrogate_cache[library_name]
+
+    def _emit_progress(
+        self,
+        callback: ProgressCallback,
+        stage: str,
+        current: int,
+        total: int,
+    ) -> None:
+        if callback is not None:
+            callback(stage, current, total)
 
     def _extract_power_breakdown(self, model_summary_df: pd.DataFrame) -> dict[str, float]:
         def model_power_w(model_name: str) -> float:
@@ -67,7 +81,7 @@ class SimulationEngine:
         tank_out = 0.0
         tank_full = 0
         tank_empty = 0
-        curtailment_h2_kg = 0.0
+        curtailed_h2_kg = 0.0
         new_soc = starting_soc_kg_h2
 
         target_h2 = min(
@@ -86,14 +100,13 @@ class SimulationEngine:
                 room = max(capacity - new_soc, 0.0)
                 tank_in = min(excess, room, max_charge)
                 new_soc += tank_in
-                curtailment_h2_kg = max(excess - tank_in, 0.0)
+                curtailed_h2_kg = max(excess - tank_in, 0.0)
                 tank_empty = int(shortage > tank_out + 1e-9 and new_soc <= 1e-9)
                 tank_full = int(excess > tank_in + 1e-9 and capacity - new_soc <= 1e-9)
             else:
-                curtailment_h2_kg = excess
+                curtailed_h2_kg = excess
 
             actual_h2 = min(direct_h2 + tank_out, case.ptmeoh.max_h2_feed_kg_per_h)
-
         else:
             raw_available = min(produced_h2_kg_per_h, case.ptmeoh.max_h2_feed_kg_per_h)
 
@@ -111,7 +124,7 @@ class SimulationEngine:
                 room = max(capacity - new_soc, 0.0)
                 tank_in = min(excess, room, max_charge)
                 new_soc += tank_in
-                curtailment_h2_kg = max(excess - tank_in, 0.0)
+                curtailed_h2_kg = max(excess - tank_in, 0.0)
                 tank_full = int(excess > tank_in + 1e-9 and capacity - new_soc <= 1e-9)
                 actual_h2 = min(target_h2, case.ptmeoh.max_h2_feed_kg_per_h)
 
@@ -125,12 +138,18 @@ class SimulationEngine:
             "tank_out_kg_per_h": tank_out,
             "tank_full_event": tank_full,
             "tank_empty_event": tank_empty,
-            "curtailed_h2_kg_per_h": curtailment_h2_kg,
+            "curtailed_h2_kg_per_h": curtailed_h2_kg,
             "new_soc_kg_h2": new_soc,
         }
 
-    def run(self, case: CaseInputs) -> SimulationArtifacts:
+    def run(
+        self,
+        case: CaseInputs,
+        progress_callback: ProgressCallback = None,
+        progress_every_steps: int = 250,
+    ) -> SimulationArtifacts:
         warnings = validate_case_inputs(case)
+        self.logger.info("Simulation started for case '%s'", case.case_name)
 
         el = ElectrolyzerModel(
             nominal_power_mw=case.electrolyzer.nominal_power_mw,
@@ -138,20 +157,20 @@ class SimulationEngine:
             min_load_fraction=case.electrolyzer.min_load_fraction,
             specific_energy_kwh_per_kg_h2=case.electrolyzer.specific_energy_kwh_per_kg_h2,
         )
-
         storage = H2StorageModel(
             capacity_kg_h2=case.storage.usable_capacity_kg_h2,
             initial_soc_fraction=case.storage.initial_soc_fraction,
             max_charge_kg_per_h=case.storage.max_charge_kg_per_h,
             max_discharge_kg_per_h=case.storage.max_discharge_kg_per_h,
         )
-
         surrogates = self._get_surrogates(case.ptmeoh.surrogate_library)
 
         rows: list[dict] = []
         model_summary_df = pd.DataFrame()
+        total_steps = len(case.renewable_profile)
+        self._emit_progress(progress_callback, "simulation", 0, max(total_steps, 1))
 
-        for _, row in case.renewable_profile.iterrows():
+        for step_index, (_, row) in enumerate(case.renewable_profile.iterrows(), start=1):
             renewable_power_mw = float(row["renewable_power_mw"])
             timestamp = row.get("timestamp")
             starting_soc = float(storage.soc_kg_h2)
@@ -169,16 +188,13 @@ class SimulationEngine:
                     renewable_power_mw - downstream_aux_power_guess_mw,
                     0.0,
                 )
-
                 el_state = el.step(power_available_for_electrolyzer_mw)
-
                 dispatch = self._dispatch_h2(
                     case=case,
                     storage=storage,
                     starting_soc_kg_h2=starting_soc,
                     produced_h2_kg_per_h=el_state.h2_produced_kg_per_h,
                 )
-
                 surrogate_outputs = surrogates.predict_all(dispatch["actual_h2_kg_per_h"])
                 this_model_summary_df = surrogate_outputs["model_summary_df"]
 
@@ -204,7 +220,6 @@ class SimulationEngine:
 
                 if abs(new_guess_mw - downstream_aux_power_guess_mw) <= 1e-6:
                     break
-
                 downstream_aux_power_guess_mw = new_guess_mw
 
             storage.soc_kg_h2 = final_dispatch["new_soc_kg_h2"]
@@ -246,15 +261,9 @@ class SimulationEngine:
                 "power_c2_mw": final_power_breakdown["power_c2_mw"],
                 "power_c3_mw": final_power_breakdown["power_c3_mw"],
                 "aux_power_from_models_w": final_power_breakdown["total_downstream_power_w"],
-                "surrogate_all_models_in_domain": int(
-                    bool(final_surrogate_outputs["all_models_in_domain"])
-                ),
-                "surrogate_runtime_models_count": int(
-                    final_surrogate_outputs["runtime_models_count"]
-                ),
-                "surrogate_total_models_count": int(
-                    final_surrogate_outputs["total_models_count"]
-                ),
+                "surrogate_all_models_in_domain": int(bool(final_surrogate_outputs["all_models_in_domain"])),
+                "surrogate_runtime_models_count": int(final_surrogate_outputs["runtime_models_count"]),
+                "surrogate_total_models_count": int(final_surrogate_outputs["total_models_count"]),
             }
 
             for key, value in final_surrogate_outputs.items():
@@ -265,6 +274,10 @@ class SimulationEngine:
 
             rows.append(record)
 
+            if step_index == 1 or step_index % progress_every_steps == 0 or step_index == total_steps:
+                self.logger.info("Simulation progress %s/%s", step_index, total_steps)
+                self._emit_progress(progress_callback, "simulation", step_index, max(total_steps, 1))
+
         df = pd.DataFrame(rows)
         te = TechnoEconomics(case)
         econ = te.compute(df)
@@ -272,24 +285,17 @@ class SimulationEngine:
         kpis = {
             "annual_methanol_t": econ["annual_meoh_t"],
             "electrolyzer_full_load_hours_h": float(
-                df["power_to_electrolyzer_mw"].sum()
-                * case.time_step_h
-                / max(case.electrolyzer.nominal_power_mw, 1e-9)
+                df["power_to_electrolyzer_mw"].sum() * case.time_step_h / max(case.electrolyzer.nominal_power_mw, 1e-9)
             ),
             "ptmeoh_utilization_factor": float(
-                df["h2_to_ptmeoh_kg_per_h"].mean()
-                / max(case.ptmeoh.max_h2_feed_kg_per_h, 1e-9)
+                df["h2_to_ptmeoh_kg_per_h"].mean() / max(case.ptmeoh.max_h2_feed_kg_per_h, 1e-9)
             ),
             "renewable_utilization_fraction": float(
-                df["renewable_used_mw"].sum()
-                / max(df["renewable_power_mw"].sum(), 1e-9)
+                df["renewable_used_mw"].sum() / max(df["renewable_power_mw"].sum(), 1e-9)
             ),
-            "h2_not_supplied_t": float(
-                df["unmet_h2_kg_per_h"].sum() * case.time_step_h / KG_PER_T
-            ),
+            "h2_not_supplied_t": float(df["unmet_h2_kg_per_h"].sum() * case.time_step_h / KG_PER_T),
             "curtailment_fraction": float(
-                df["curtailed_power_mw"].sum()
-                / max(df["renewable_power_mw"].sum(), 1e-9)
+                df["curtailed_power_mw"].sum() / max(df["renewable_power_mw"].sum(), 1e-9)
             ),
             "annual_total_electricity_mwh": econ["annual_power_mwh"],
             "annual_downstream_electricity_mwh": econ["annual_downstream_power_mwh"],
@@ -298,61 +304,41 @@ class SimulationEngine:
             "lcoh_usd_per_t_h2": econ["lcoh_usd_per_t_h2"],
             "lcomeoh_usd_per_t_meoh": econ["lcomeoh_usd_per_t_meoh"],
             "npv_usd": econ["npv_usd"],
-            "surrogate_out_of_domain_fraction": float(
-                1.0 - df["surrogate_all_models_in_domain"].mean()
-            ),
+            "surrogate_out_of_domain_fraction": float(1.0 - df["surrogate_all_models_in_domain"].mean()),
             "tank_empty_hours": float(df["tank_empty_event"].sum() * case.time_step_h),
             "tank_full_hours": float(df["tank_full_event"].sum() * case.time_step_h),
-            "curtailed_hours": float(
-                (df["curtailed_power_mw"] > 0).sum() * case.time_step_h
-            ),
+            "curtailed_hours": float((df["curtailed_power_mw"] > 0).sum() * case.time_step_h),
             "runtime_models_fraction": float(
-                df["surrogate_runtime_models_count"].max()
-                / max(df["surrogate_total_models_count"].max(), 1)
+                df["surrogate_runtime_models_count"].max() / max(df["surrogate_total_models_count"].max(), 1)
             ),
         }
 
         unmet_fraction = float(
             df["unmet_h2_kg_per_h"].sum()
-            / max(
-                df["h2_to_ptmeoh_kg_per_h"].sum()
-                + df["unmet_h2_kg_per_h"].sum(),
-                1e-9,
-            )
+            / max(df["h2_to_ptmeoh_kg_per_h"].sum() + df["unmet_h2_kg_per_h"].sum(), 1e-9)
         )
 
         if kpis["surrogate_out_of_domain_fraction"] > 0:
-            warnings.append(
-                "Selected operating range exceeds the surrogate validity domain during part of the simulated year."
-            )
+            warnings.append("Selected operating range exceeds the surrogate validity domain during part of the simulated year.")
         if unmet_fraction > case.ptmeoh.unmet_h2_warning_threshold:
             warnings.append("Unmet H2 exceeds the configured warning threshold.")
         if kpis["curtailment_fraction"] > case.ptmeoh.curtailment_warning_threshold:
-            warnings.append(
-                "Renewable curtailment exceeds the configured warning threshold."
-            )
+            warnings.append("Renewable curtailment exceeds the configured warning threshold.")
         if kpis["ptmeoh_utilization_factor"] < case.ptmeoh.utilization_warning_threshold:
-            warnings.append(
-                "PtMeOH utilization is below the configured warning threshold."
-            )
+            warnings.append("PtMeOH utilization is below the configured warning threshold.")
         if kpis["runtime_models_fraction"] < 1.0:
-            warnings.append(
-                "At least one surrogate model package is incomplete; fallback mock predictions are being used for missing runtime artifacts."
-            )
+            warnings.append("At least one surrogate model package is incomplete; fallback mock predictions are being used for missing runtime artifacts.")
         if float(df["power_deficit_mw"].max()) > 1e-6:
-            warnings.append(
-                "Downstream auxiliary electrical demand exceeded the renewable supply in at least one timestep; review renewable sizing and PtMeOH operating limits."
-            )
+            warnings.append("Downstream auxiliary electrical demand exceeded the renewable supply in at least one timestep; review renewable sizing and PtMeOH operating limits.")
 
         surrogate_info = {
             "library_name": case.ptmeoh.surrogate_library,
-            "models_detected": int(df["surrogate_total_models_count"].max())
-            if not df.empty
-            else 0,
-            "runtime_models_detected": int(df["surrogate_runtime_models_count"].max())
-            if not df.empty
-            else 0,
+            "models_detected": int(df["surrogate_total_models_count"].max()) if not df.empty else 0,
+            "runtime_models_detected": int(df["surrogate_runtime_models_count"].max()) if not df.empty else 0,
         }
+
+        self.logger.info("Simulation finished for case '%s'", case.case_name)
+        self._emit_progress(progress_callback, "simulation", max(total_steps, 1), max(total_steps, 1))
 
         return SimulationArtifacts(
             time_series=df,
