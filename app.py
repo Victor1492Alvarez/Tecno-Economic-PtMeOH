@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 from zipfile import BadZipFile, ZipFile
+from typing import Callable
 
 import pandas as pd
 import streamlit as st
@@ -12,6 +13,8 @@ import streamlit as st
 from application.case_runner import CaseRunner
 from infrastructure.model_registry import ModelRegistry
 from presentation.plotting import heatmap, line_profile, tornado
+
+ProgressCallback = Callable[[str, int, int], None] | None
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PERSIST_ROOT = PROJECT_ROOT / "user_data"
@@ -230,16 +233,30 @@ def install_model_zip(
     }
 
 
-def run_simulation(case):
-    return runner.engine.run(case)
+def run_simulation(case, progress_callback: ProgressCallback = None):
+    return runner.run_simulation(case, progress_callback=progress_callback)
 
 
-def run_optimization(case):
-    return runner.optimizer.run(case)
+def run_optimization(case, progress_callback: ProgressCallback = None):
+    return runner.run_optimization(case, progress_callback=progress_callback)
 
 
 def run_sensitivities(case):
-    return runner.sensitivity.run(case)
+    return runner.run_sensitivity(case)
+
+
+def run_all_workflows(
+    case,
+    run_optimization_flag: bool = True,
+    run_sensitivity_flag: bool = True,
+    progress_callback: ProgressCallback = None,
+):
+    return runner.run_all(
+        case,
+        run_optimization=run_optimization_flag,
+        run_sensitivity=run_sensitivity_flag,
+        progress_callback=progress_callback,
+    )
 
 
 render_flash_message()
@@ -602,29 +619,106 @@ case = runner.build_case(
     electricity_price_usd_per_kwh=float(electricity_price_usd_per_kwh),
 )
 
+run_opt_in_run_all = st.checkbox(
+    "Run optimization during Run All",
+    value=True,
+    help="Turn off the grid search when you only want the base simulation.",
+)
+run_sens_in_run_all = st.checkbox(
+    "Run sensitivity during Run All",
+    value=True,
+    help="Turn off sensitivity analysis to reduce execution time.",
+)
+
+progress_bar = st.progress(0)
+status_box = st.empty()
+
+def ui_progress(stage: str, current: int, total: int) -> None:
+    safe_total = max(total, 1)
+    pct = min(current / safe_total, 1.0)
+    progress_bar.progress(pct)
+    status_box.info(f"Stage: {stage} | Progress: {current}/{safe_total}")
+
+
 action_col1, action_col2, action_col3, action_col4 = st.columns(4)
 
 with action_col1:
     if st.button("Run annual simulation", use_container_width=True):
-        with st.spinner("Running annual simulation..."):
-            st.session_state["simulation"] = run_simulation(case)
+        try:
+            progress_bar.progress(0)
+            status_box.info("Running base simulation...")
+            st.session_state["simulation"] = run_simulation(
+                case,
+                progress_callback=ui_progress,
+            )
+            progress_bar.progress(1.0)
+            status_box.success("Base simulation completed.")
+        except Exception as exc:
+            status_box.error(f"Simulation failed: {exc}")
+            st.exception(exc)
 
 with action_col2:
     if st.button("Run optimization", use_container_width=True):
-        with st.spinner("Running grid optimization..."):
-            st.session_state["optimization"] = run_optimization(case)
+        try:
+            progress_bar.progress(0)
+            status_box.info("Running grid optimization...")
+            st.session_state["optimization"] = run_optimization(
+                case,
+                progress_callback=ui_progress,
+            )
+            progress_bar.progress(1.0)
+            status_box.success("Optimization completed.")
+        except Exception as exc:
+            status_box.error(f"Optimization failed: {exc}")
+            st.exception(exc)
 
 with action_col3:
     if st.button("Run sensitivities", use_container_width=True):
-        with st.spinner("Running sensitivity analysis..."):
+        try:
+            progress_bar.progress(0)
+            status_box.info("Running sensitivity analysis...")
             st.session_state["sensitivities"] = run_sensitivities(case)
+            progress_bar.progress(1.0)
+            status_box.success("Sensitivity analysis completed.")
+        except Exception as exc:
+            status_box.error(f"Sensitivity analysis failed: {exc}")
+            st.exception(exc)
 
 with action_col4:
-    if st.button("Run all", use_container_width=True):
-        with st.spinner("Running full workflow..."):
-            st.session_state["simulation"] = run_simulation(case)
-            st.session_state["optimization"] = run_optimization(case)
-            st.session_state["sensitivities"] = run_sensitivities(case)
+    if st.button("Run all", use_container_width=True, type="primary"):
+        try:
+            progress_bar.progress(0)
+            status_box.info("Preparing run...")
+            outputs = run_all_workflows(
+                case,
+                run_optimization_flag=run_opt_in_run_all,
+                run_sensitivity_flag=run_sens_in_run_all,
+                progress_callback=ui_progress,
+            )
+            st.session_state["simulation"] = outputs["simulation"]
+            st.session_state["optimization"] = outputs["optimization"]
+            st.session_state["sensitivities"] = outputs["sensitivity"]
+            progress_bar.progress(1.0)
+            status_box.success("Run completed.")
+        except Exception as exc:
+            status_box.error(f"Run failed: {exc}")
+            st.exception(exc)
+
+with st.expander("Execution diagnostics", expanded=False):
+    st.write("Use this panel to understand what the app is doing during long runs.")
+    st.write(f"Optimization enabled in Run All: {run_opt_in_run_all}")
+    st.write(f"Sensitivity enabled in Run All: {run_sens_in_run_all}")
+    if active_profile_df is not None:
+        st.write(f"Renewable profile rows: {len(active_profile_df)}")
+    else:
+        st.write("Renewable profile rows: synthetic default profile")
+    st.write(
+        "Estimated optimization combinations:",
+        len(case.optimization.electrolyzer_power_grid_mw)
+        * len(case.optimization.storage_grid_kg_h2)
+        * len(case.optimization.target_h2_grid_kg_per_h)
+        * len(case.optimization.module_count_grid),
+    )
 
 simulation = st.session_state.get("simulation")
 optimization = st.session_state.get("optimization")
