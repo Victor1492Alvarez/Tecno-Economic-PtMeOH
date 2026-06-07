@@ -348,7 +348,7 @@ def get_telemetry_text(last_n: int = 40) -> str:
     ensure_runtime_feedback_state()
     lines = st.session_state.get("telemetry_lines", [])
     if not lines:
-        return "Sin mensajes de telemetría todavía."
+        return "No telemetry messages yet."
     return "\n".join(lines[-last_n:])
 
 
@@ -396,17 +396,17 @@ def format_progress_label(stage: str, current: int, total: int) -> tuple[float, 
         days_total = hours_total / 24.0
         label = (
             f"Annual simulation | {pct:5.1f}% | "
-            f"{hours_done:,}/{hours_total:,} h simuladas | "
-            f"{days_done:,.2f}/{days_total:,.2f} días"
+            f"{hours_done:,}/{hours_total:,} simulated h | "
+            f"{days_done:,.2f}/{days_total:,.2f} days"
         )
         return pct, label
 
     if stage_key == "optimization":
-        label = f"Optimization | {pct:5.1f}% | {safe_current:,}/{safe_total:,} casos evaluados"
+        label = f"Optimization | {pct:5.1f}% | {safe_current:,}/{safe_total:,} cases evaluated"
         return pct, label
 
     if stage_key == "sensitivity":
-        label = f"Sensitivity | {pct:5.1f}% | {safe_current:,}/{safe_total:,} perturbaciones"
+        label = f"Sensitivity | {pct:5.1f}% | {safe_current:,}/{safe_total:,} perturbations"
         return pct, label
 
     label = f"{stage} | {pct:5.1f}% | {safe_current:,}/{safe_total:,}"
@@ -424,7 +424,7 @@ def run_simulation(case, progress_callback: ProgressCallback = None):
         return runner.engine.run(case, progress_callback=progress_callback)
     except TypeError:
         append_telemetry_line(
-            "WARNING | El motor no acepta progress_callback; se ejecutará sin progreso fino desde backend."
+            "WARNING | The simulation engine does not accept progress_callback; it will run without fine-grained backend progress."
         )
         return runner.engine.run(case)
 
@@ -440,7 +440,7 @@ def run_optimization(case, progress_callback: ProgressCallback = None):
         return runner.optimizer.run(case, progress_callback=progress_callback)
     except TypeError:
         append_telemetry_line(
-            "WARNING | El optimizador no acepta progress_callback; se ejecutará sin progreso fino desde backend."
+            "WARNING | The optimizer does not accept progress_callback; it will run without fine-grained backend progress."
         )
         return runner.optimizer.run(case)
 
@@ -1052,7 +1052,7 @@ st.subheader("Execution monitor")
 progress_bar = st.progress(0.0, text="Idle | 0.0%")
 progress_caption = st.empty()
 
-with st.expander("Telemetría en tiempo real", expanded=True):
+with st.expander("Real-time telemetry", expanded=True):
     telemetry_placeholder = st.empty()
     telemetry_placeholder.code(get_telemetry_text(), language="text")
 
@@ -1070,7 +1070,7 @@ def start_runtime_feedback(title: str) -> None:
 
 
 def finish_runtime_feedback(title: str) -> None:
-    append_telemetry_line(f"UI | {title} completado")
+    append_telemetry_line(f"UI | {title} completed")
     progress_bar.progress(1.0, text=f"{title} | 100.0%")
     progress_caption.success(title)
     refresh_runtime_panels()
@@ -1095,70 +1095,70 @@ action_col1, action_col2, action_col3, action_col4 = st.columns(4)
 with action_col1:
     if st.button("Run annual simulation", use_container_width=True, disabled=run_disabled):
         try:
-            start_runtime_feedback("Annual simulation iniciada")
-            append_telemetry_line("UI | Construyendo llamada al motor anual")
+            start_runtime_feedback("Annual simulation started")
+            append_telemetry_line("UI | Building annual engine call")
             st.session_state["simulation"] = run_simulation(
                 case,
                 progress_callback=ui_progress,
             )
-            finish_runtime_feedback("Annual simulation completada")
+            finish_runtime_feedback("Annual simulation completed")
         except Exception as exc:
-            fail_runtime_feedback("Annual simulation falló", exc)
+            fail_runtime_feedback("Annual simulation failed", exc)
             st.exception(exc)
 
 with action_col2:
     if st.button("Run optimization", use_container_width=True, disabled=run_disabled):
         try:
-            start_runtime_feedback("Optimization iniciada")
-            append_telemetry_line("UI | Lanzando grid search")
+            start_runtime_feedback("Optimization started")
+            append_telemetry_line("UI | Launching grid search")
             st.session_state["optimization"] = run_optimization(
                 case,
                 progress_callback=ui_progress,
             )
-            finish_runtime_feedback("Optimization completada")
+            finish_runtime_feedback("Optimization completed")
         except Exception as exc:
-            fail_runtime_feedback("Optimization falló", exc)
+            fail_runtime_feedback("Optimization failed", exc)
             st.exception(exc)
 
 with action_col3:
     if st.button("Run sensitivities", use_container_width=True, disabled=run_disabled):
         try:
-            start_runtime_feedback("Sensitivity analysis iniciada")
-            append_telemetry_line("UI | Lanzando análisis de sensibilidad")
+            start_runtime_feedback("Sensitivity analysis started")
+            append_telemetry_line("UI | Launching sensitivity analysis")
             st.session_state["sensitivities"] = run_sensitivities(
                 case,
                 progress_callback=ui_progress,
             )
-            finish_runtime_feedback("Sensitivity analysis completada")
+            finish_runtime_feedback("Sensitivity analysis completed")
         except Exception as exc:
-            fail_runtime_feedback("Sensitivity analysis falló", exc)
+            fail_runtime_feedback("Sensitivity analysis failed", exc)
             st.exception(exc)
 
 with action_col4:
     if st.button("Run all", use_container_width=True, disabled=run_disabled):
         try:
-            start_runtime_feedback("Run all iniciado")
-            append_telemetry_line("UI | Ejecutando annual simulation")
+            start_runtime_feedback("Run all started")
+            append_telemetry_line("UI | Running annual simulation")
             st.session_state["simulation"] = run_simulation(
                 case,
                 progress_callback=ui_progress,
             )
 
-            append_telemetry_line("UI | Ejecutando optimization")
+            append_telemetry_line("UI | Running optimization")
             st.session_state["optimization"] = run_optimization(
                 case,
                 progress_callback=ui_progress,
             )
 
-            append_telemetry_line("UI | Ejecutando sensitivities")
+            append_telemetry_line("UI | Running sensitivities")
             st.session_state["sensitivities"] = run_sensitivities(
                 case,
                 progress_callback=ui_progress,
             )
 
-            finish_runtime_feedback("Run all completado")
+            finish_runtime_feedback("Run all completed")
         except Exception as exc:
-            fail_runtime_feedback("Run all falló", exc)
+            fail_runtime_feedback("Run all failed", exc)
             st.exception(exc)
 
 simulation = st.session_state.get("simulation")
