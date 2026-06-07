@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from io import BytesIO
 import json
+import logging
 from pathlib import Path
 import re
+from typing import Callable, Optional
 from zipfile import BadZipFile, ZipFile
 
 import pandas as pd
@@ -26,6 +28,8 @@ SCENARIO_PRICE_DEFAULTS_USD_PER_KWH = {
     "pessimistic": 80.0 / 1000.0,
 }
 
+ProgressCallback = Optional[Callable[[str, int, int], None]]
+
 runner = CaseRunner(PROJECT_ROOT)
 registry = ModelRegistry(PROJECT_ROOT)
 
@@ -33,7 +37,7 @@ st.set_page_config(page_title="PtMeOH Sizing Tool V2", layout="wide")
 st.title("PtMeOH Plant Sizing Tool — Version 2")
 st.caption(
     "Annual deterministic simulator with surrogate governance, renewable-profile diagnostics, "
-    "pre-run consistency checks, and expanded operational observability."
+    "pre-run consistency checks, execution monitoring, and expanded operational observability."
 )
 
 
@@ -74,7 +78,9 @@ def get_scenario_price_default(scenario_name: str) -> float:
             return float(runner_cfg[scenario_name]["electricity_price_usd_per_mwh"]) / 1000.0
         except Exception:
             pass
-    return SCENARIO_PRICE_DEFAULTS_USD_PER_KWH.get(scenario_name, SCENARIO_PRICE_DEFAULTS_USD_PER_KWH["moderate"])
+    return SCENARIO_PRICE_DEFAULTS_USD_PER_KWH.get(
+        scenario_name, SCENARIO_PRICE_DEFAULTS_USD_PER_KWH["moderate"]
+    )
 
 
 def read_tabular_file(uploaded_file) -> pd.DataFrame:
@@ -305,16 +311,154 @@ def install_model_zip(
     }
 
 
-def run_simulation(case):
-    return runner.engine.run(case)
+class StreamlitTelemetryHandler(logging.Handler):
+    def __init__(self, emit_fn):
+        super().__init__(level=logging.INFO)
+        self.emit_fn = emit_fn
+        self._streamlit_telemetry = True
+
+    def emit(self, record):
+        try:
+            self.emit_fn(self.format(record))
+        except Exception:
+            pass
 
 
-def run_optimization(case):
-    return runner.optimizer.run(case)
+def ensure_runtime_feedback_state() -> None:
+    if "telemetry_lines" not in st.session_state:
+        st.session_state["telemetry_lines"] = []
 
 
-def run_sensitivities(case):
-    return runner.sensitivity.run(case)
+def clear_telemetry() -> None:
+    st.session_state["telemetry_lines"] = []
+
+
+def append_telemetry_line(message: str, max_lines: int = 250) -> None:
+    ensure_runtime_feedback_state()
+    timestamp = pd.Timestamp.now().strftime("%H:%M:%S")
+    line = f"{timestamp} | {message}"
+    lines = st.session_state["telemetry_lines"]
+    if not lines or lines[-1] != line:
+        lines.append(line)
+    if len(lines) > max_lines:
+        st.session_state["telemetry_lines"] = lines[-max_lines:]
+
+
+def get_telemetry_text(last_n: int = 40) -> str:
+    ensure_runtime_feedback_state()
+    lines = st.session_state.get("telemetry_lines", [])
+    if not lines:
+        return "Sin mensajes de telemetría todavía."
+    return "\n".join(lines[-last_n:])
+
+
+def attach_streamlit_telemetry_handler() -> None:
+    ensure_runtime_feedback_state()
+
+    candidate_loggers = []
+    for logger_obj in [
+        getattr(runner, "logger", None),
+        getattr(getattr(runner, "engine", None), "logger", None),
+        getattr(getattr(runner, "optimizer", None), "logger", None),
+        getattr(getattr(runner, "sensitivity", None), "logger", None),
+        logging.getLogger("ptmeoh_tool"),
+        logging.getLogger("ptmeoh_tool.simulation"),
+        logging.getLogger("ptmeoh_tool.optimization"),
+        logging.getLogger("ptmeoh_tool.sensitivity"),
+    ]:
+        if logger_obj is not None and logger_obj not in candidate_loggers:
+            candidate_loggers.append(logger_obj)
+
+    for logger_obj in candidate_loggers:
+        if any(getattr(h, "_streamlit_telemetry", False) for h in logger_obj.handlers):
+            continue
+        handler = StreamlitTelemetryHandler(append_telemetry_line)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
+        logger_obj.addHandler(handler)
+        logger_obj.setLevel(logging.INFO)
+
+
+def format_progress_label(stage: str, current: int, total: int) -> tuple[float, str]:
+    safe_total = max(int(total), 1)
+    safe_current = max(0, min(int(current), safe_total))
+    pct = 100.0 * safe_current / safe_total
+    stage_key = str(stage).lower().strip()
+
+    if stage_key == "simulation":
+        hours_done = safe_current
+        hours_total = safe_total
+        days_done = hours_done / 24.0
+        days_total = hours_total / 24.0
+        label = (
+            f"Annual simulation | {pct:5.1f}% | "
+            f"{hours_done:,}/{hours_total:,} h simuladas | "
+            f"{days_done:,.2f}/{days_total:,.2f} días"
+        )
+        return pct, label
+
+    if stage_key == "optimization":
+        label = f"Optimization | {pct:5.1f}% | {safe_current:,}/{safe_total:,} casos evaluados"
+        return pct, label
+
+    if stage_key == "sensitivity":
+        label = f"Sensitivity | {pct:5.1f}% | {safe_current:,}/{safe_total:,} perturbaciones"
+        return pct, label
+
+    label = f"{stage} | {pct:5.1f}% | {safe_current:,}/{safe_total:,}"
+    return pct, label
+
+
+def run_simulation(case, progress_callback: ProgressCallback = None):
+    if hasattr(runner, "run_simulation"):
+        try:
+            return runner.run_simulation(case, progress_callback=progress_callback)
+        except TypeError:
+            pass
+
+    try:
+        return runner.engine.run(case, progress_callback=progress_callback)
+    except TypeError:
+        append_telemetry_line(
+            "WARNING | El motor no acepta progress_callback; se ejecutará sin progreso fino desde backend."
+        )
+        return runner.engine.run(case)
+
+
+def run_optimization(case, progress_callback: ProgressCallback = None):
+    if hasattr(runner, "run_optimization"):
+        try:
+            return runner.run_optimization(case, progress_callback=progress_callback)
+        except TypeError:
+            pass
+
+    try:
+        return runner.optimizer.run(case, progress_callback=progress_callback)
+    except TypeError:
+        append_telemetry_line(
+            "WARNING | El optimizador no acepta progress_callback; se ejecutará sin progreso fino desde backend."
+        )
+        return runner.optimizer.run(case)
+
+
+def run_sensitivities(case, progress_callback: ProgressCallback = None):
+    if hasattr(runner, "run_sensitivity"):
+        try:
+            return runner.run_sensitivity(case, progress_callback=progress_callback)
+        except TypeError:
+            pass
+
+    if hasattr(runner, "sensitivity"):
+        try:
+            return runner.sensitivity.run(case, progress_callback=progress_callback)
+        except TypeError:
+            return runner.sensitivity.run(case)
+
+    raise AttributeError("No sensitivity runner was found.")
 
 
 def build_profile_diagnostics(profile_df: pd.DataFrame, electrolyzer_power_mw: float, min_load_fraction: float) -> dict:
@@ -501,7 +645,11 @@ def build_balance_bar_chart(ts: pd.DataFrame):
         title="Annual balance overview",
         color_discrete_sequence=["#0b7285"],
     )
-    fig.update_layout(paper_bgcolor="#f4f8f8", plot_bgcolor="white", margin=dict(l=20, r=20, t=50, b=20))
+    fig.update_layout(
+        paper_bgcolor="#f4f8f8",
+        plot_bgcolor="white",
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
     return fig
 
 
@@ -591,9 +739,7 @@ with st.sidebar:
         value=2200.0,
         step=10.0,
         format="%.3f",
-        help=(
-            "Hard upper bound on how much H2 the downstream PtMeOH train can physically absorb."
-        ),
+        help="Hard upper bound on how much H2 the downstream PtMeOH train can physically absorb.",
     )
 
     with st.expander("Explain downstream H2 variables", expanded=False):
@@ -899,29 +1045,121 @@ pre_errors, pre_warnings, pre_infos = build_pre_run_messages(
 
 run_disabled = len(pre_errors) > 0
 
+attach_streamlit_telemetry_handler()
+ensure_runtime_feedback_state()
+
+st.subheader("Execution monitor")
+progress_bar = st.progress(0.0, text="Idle | 0.0%")
+progress_caption = st.empty()
+
+with st.expander("Telemetría en tiempo real", expanded=True):
+    telemetry_placeholder = st.empty()
+    telemetry_placeholder.code(get_telemetry_text(), language="text")
+
+
+def refresh_runtime_panels() -> None:
+    telemetry_placeholder.code(get_telemetry_text(), language="text")
+
+
+def start_runtime_feedback(title: str) -> None:
+    clear_telemetry()
+    append_telemetry_line(f"UI | {title}")
+    progress_bar.progress(0.0, text=f"{title} | 0.0%")
+    progress_caption.info(title)
+    refresh_runtime_panels()
+
+
+def finish_runtime_feedback(title: str) -> None:
+    append_telemetry_line(f"UI | {title} completado")
+    progress_bar.progress(1.0, text=f"{title} | 100.0%")
+    progress_caption.success(title)
+    refresh_runtime_panels()
+
+
+def fail_runtime_feedback(title: str, exc: Exception) -> None:
+    append_telemetry_line(f"ERROR | {title} | {exc}")
+    progress_caption.error(f"{title}: {exc}")
+    refresh_runtime_panels()
+
+
+def ui_progress(stage: str, current: int, total: int) -> None:
+    pct, label = format_progress_label(stage, current, total)
+    progress_bar.progress(min(max(pct / 100.0, 0.0), 1.0), text=label)
+    progress_caption.caption(label)
+    append_telemetry_line(f"PROGRESS | {label}")
+    refresh_runtime_panels()
+
+
 action_col1, action_col2, action_col3, action_col4 = st.columns(4)
 
 with action_col1:
     if st.button("Run annual simulation", use_container_width=True, disabled=run_disabled):
-        with st.spinner("Running annual simulation..."):
-            st.session_state["simulation"] = run_simulation(case)
+        try:
+            start_runtime_feedback("Annual simulation iniciada")
+            append_telemetry_line("UI | Construyendo llamada al motor anual")
+            st.session_state["simulation"] = run_simulation(
+                case,
+                progress_callback=ui_progress,
+            )
+            finish_runtime_feedback("Annual simulation completada")
+        except Exception as exc:
+            fail_runtime_feedback("Annual simulation falló", exc)
+            st.exception(exc)
 
 with action_col2:
     if st.button("Run optimization", use_container_width=True, disabled=run_disabled):
-        with st.spinner("Running grid optimization..."):
-            st.session_state["optimization"] = run_optimization(case)
+        try:
+            start_runtime_feedback("Optimization iniciada")
+            append_telemetry_line("UI | Lanzando grid search")
+            st.session_state["optimization"] = run_optimization(
+                case,
+                progress_callback=ui_progress,
+            )
+            finish_runtime_feedback("Optimization completada")
+        except Exception as exc:
+            fail_runtime_feedback("Optimization falló", exc)
+            st.exception(exc)
 
 with action_col3:
     if st.button("Run sensitivities", use_container_width=True, disabled=run_disabled):
-        with st.spinner("Running sensitivity analysis..."):
-            st.session_state["sensitivities"] = run_sensitivities(case)
+        try:
+            start_runtime_feedback("Sensitivity analysis iniciada")
+            append_telemetry_line("UI | Lanzando análisis de sensibilidad")
+            st.session_state["sensitivities"] = run_sensitivities(
+                case,
+                progress_callback=ui_progress,
+            )
+            finish_runtime_feedback("Sensitivity analysis completada")
+        except Exception as exc:
+            fail_runtime_feedback("Sensitivity analysis falló", exc)
+            st.exception(exc)
 
 with action_col4:
     if st.button("Run all", use_container_width=True, disabled=run_disabled):
-        with st.spinner("Running full workflow..."):
-            st.session_state["simulation"] = run_simulation(case)
-            st.session_state["optimization"] = run_optimization(case)
-            st.session_state["sensitivities"] = run_sensitivities(case)
+        try:
+            start_runtime_feedback("Run all iniciado")
+            append_telemetry_line("UI | Ejecutando annual simulation")
+            st.session_state["simulation"] = run_simulation(
+                case,
+                progress_callback=ui_progress,
+            )
+
+            append_telemetry_line("UI | Ejecutando optimization")
+            st.session_state["optimization"] = run_optimization(
+                case,
+                progress_callback=ui_progress,
+            )
+
+            append_telemetry_line("UI | Ejecutando sensitivities")
+            st.session_state["sensitivities"] = run_sensitivities(
+                case,
+                progress_callback=ui_progress,
+            )
+
+            finish_runtime_feedback("Run all completado")
+        except Exception as exc:
+            fail_runtime_feedback("Run all falló", exc)
+            st.exception(exc)
 
 simulation = st.session_state.get("simulation")
 optimization = st.session_state.get("optimization")
@@ -1027,114 +1265,126 @@ with tab2:
     if simulation is None:
         st.info("Press 'Run annual simulation' to generate results.")
     else:
-        for warning in simulation.warnings:
+        for warning in getattr(simulation, "warnings", []):
             st.warning(warning)
+
+        kpis = getattr(simulation, "kpis", {})
+        ts = getattr(simulation, "time_series", pd.DataFrame())
 
         st.subheader("Main KPIs")
         m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Annual MeOH [t/y]", f"{simulation.kpis['annual_methanol_t']:,.3f}")
-        m2.metric("Electrolyzer FLH [h/y]", f"{simulation.kpis['electrolyzer_full_load_hours_h']:,.1f}")
-        m3.metric("PtMeOH utilization [-]", f"{simulation.kpis['ptmeoh_utilization_factor']:.4f}")
-        m4.metric("Renewable utilization [-]", f"{simulation.kpis['renewable_utilization_fraction']:.4f}")
-        m5.metric("LCOMeOH [USD/t]", f"{simulation.kpis['lcomeoh_usd_per_t_meoh']:,.3f}")
-        m6.metric("NPV [USD]", f"{simulation.kpis['npv_usd']:,.1f}")
+        m1.metric("Annual MeOH [t/y]", f"{kpis.get('annual_methanol_t', float('nan')):,.3f}")
+        m2.metric("Electrolyzer FLH [h/y]", f"{kpis.get('electrolyzer_full_load_hours_h', float('nan')):,.1f}")
+        m3.metric("PtMeOH utilization [-]", f"{kpis.get('ptmeoh_utilization_factor', float('nan')):.4f}")
+        m4.metric("Renewable utilization [-]", f"{kpis.get('renewable_utilization_fraction', float('nan')):.4f}")
+        m5.metric("LCOMeOH [USD/t]", f"{kpis.get('lcomeoh_usd_per_t_meoh', float('nan')):,.3f}")
+        m6.metric("NPV [USD]", f"{kpis.get('npv_usd', float('nan')):,.1f}")
 
         st.subheader("Diagnostic KPIs")
         d1, d2, d3, d4 = st.columns(4)
-        d1.metric("Surrogate out-of-domain [-]", f"{simulation.kpis['surrogate_out_of_domain_fraction']:.4f}")
-        d2.metric("Curtailment fraction [-]", f"{simulation.kpis['curtailment_fraction']:.4f}")
-        d3.metric("Unmet H2 [t/y]", f"{simulation.kpis['h2_not_supplied_t']:,.4f}")
-        d4.metric("Runtime models fraction [-]", f"{simulation.kpis['runtime_models_fraction']:.4f}")
+        d1.metric("Surrogate out-of-domain [-]", f"{kpis.get('surrogate_out_of_domain_fraction', float('nan')):.4f}")
+        d2.metric("Curtailment fraction [-]", f"{kpis.get('curtailment_fraction', float('nan')):.4f}")
+        d3.metric("Unmet H2 [t/y]", f"{kpis.get('h2_not_supplied_t', float('nan')):,.4f}")
+        d4.metric("Runtime models fraction [-]", f"{kpis.get('runtime_models_fraction', float('nan')):.4f}")
 
         d5, d6, d7, d8 = st.columns(4)
-        d5.metric("Tank empty hours [h/y]", f"{simulation.kpis['tank_empty_hours']:,.1f}")
-        d6.metric("Tank full hours [h/y]", f"{simulation.kpis['tank_full_hours']:,.1f}")
-        d7.metric("Curtailed hours [h/y]", f"{simulation.kpis['curtailed_hours']:,.1f}")
-        d8.metric("Annual total electricity [MWh/y]", f"{simulation.kpis['annual_total_electricity_mwh']:,.3f}")
+        d5.metric("Tank empty hours [h/y]", f"{kpis.get('tank_empty_hours', float('nan')):,.1f}")
+        d6.metric("Tank full hours [h/y]", f"{kpis.get('tank_full_hours', float('nan')):,.1f}")
+        d7.metric("Curtailed hours [h/y]", f"{kpis.get('curtailed_hours', float('nan')):,.1f}")
+        d8.metric("Annual total electricity [MWh/y]", f"{kpis.get('annual_total_electricity_mwh', float('nan')):,.3f}")
 
-        ts = simulation.time_series
+        if not ts.empty:
+            st.plotly_chart(
+                line_profile(
+                    ts.iloc[:336],
+                    ["renewable_power_mw", "power_to_electrolyzer_mw"],
+                    "Renewable and electrolyzer power — first two weeks",
+                    "Power [MW]",
+                ),
+                use_container_width=True,
+            )
 
-        st.plotly_chart(
-            line_profile(
-                ts.iloc[:336],
-                ["renewable_power_mw", "power_to_electrolyzer_mw"],
-                "Renewable and electrolyzer power — first two weeks",
-                "Power [MW]",
-            ),
-            use_container_width=True,
-        )
+            st.plotly_chart(
+                line_profile(
+                    ts.iloc[:336],
+                    ["h2_produced_kg_per_h", "h2_to_ptmeoh_kg_per_h", "tank_soc_kg_h2"],
+                    "Hydrogen production, PtMeOH feed, and tank state of charge — first two weeks",
+                    "H2 / SOC [kg or kg/h]",
+                ),
+                use_container_width=True,
+            )
 
-        st.plotly_chart(
-            line_profile(
-                ts.iloc[:336],
-                ["h2_produced_kg_per_h", "h2_to_ptmeoh_kg_per_h", "tank_soc_kg_h2"],
-                "Hydrogen production, PtMeOH feed, and tank state of charge — first two weeks",
-                "H2 / SOC [kg or kg/h]",
-            ),
-            use_container_width=True,
-        )
+            st.plotly_chart(
+                line_profile(
+                    ts.iloc[:336],
+                    ["methanol_t_per_h", "unmet_h2_kg_per_h"],
+                    "Methanol production and unmet H2 — first two weeks",
+                    "Production / unmet H2",
+                ),
+                use_container_width=True,
+            )
 
-        st.plotly_chart(
-            line_profile(
-                ts.iloc[:336],
-                ["methanol_t_per_h", "unmet_h2_kg_per_h"],
-                "Methanol production and unmet H2 — first two weeks",
-                "Production / unmet H2",
-            ),
-            use_container_width=True,
-        )
+            st.plotly_chart(
+                build_daily_mean_chart(
+                    ts,
+                    ["renewable_power_mw", "power_to_electrolyzer_mw", "downstream_aux_power_mw"],
+                    "Daily mean power profile — full year",
+                    "Power [MW]",
+                ),
+                use_container_width=True,
+            )
 
-        st.plotly_chart(
-            build_daily_mean_chart(
-                ts,
-                ["renewable_power_mw", "power_to_electrolyzer_mw", "downstream_aux_power_mw"],
-                "Daily mean power profile — full year",
-                "Power [MW]",
-            ),
-            use_container_width=True,
-        )
+            st.plotly_chart(
+                build_daily_mean_chart(
+                    ts,
+                    ["h2_produced_kg_per_h", "h2_to_ptmeoh_kg_per_h", "unmet_h2_kg_per_h"],
+                    "Daily mean H2 profile — full year",
+                    "H2 [kg/h]",
+                ),
+                use_container_width=True,
+            )
 
-        st.plotly_chart(
-            build_daily_mean_chart(
-                ts,
-                ["h2_produced_kg_per_h", "h2_to_ptmeoh_kg_per_h", "unmet_h2_kg_per_h"],
-                "Daily mean H2 profile — full year",
-                "H2 [kg/h]",
-            ),
-            use_container_width=True,
-        )
+            st.plotly_chart(build_diagnostic_event_chart(ts), use_container_width=True)
+            st.plotly_chart(build_balance_bar_chart(ts), use_container_width=True)
 
-        st.plotly_chart(build_diagnostic_event_chart(ts), use_container_width=True)
-        st.plotly_chart(build_balance_bar_chart(ts), use_container_width=True)
+            with st.expander("Surrogate and runtime diagnostics", expanded=False):
+                surrogate_info = getattr(simulation, "surrogate_info", {})
+                model_summary = getattr(simulation, "model_summary", pd.DataFrame())
+                st.write(surrogate_info)
+                if isinstance(model_summary, pd.DataFrame) and not model_summary.empty:
+                    st.dataframe(model_summary, use_container_width=True, hide_index=True)
 
-        with st.expander("Surrogate and runtime diagnostics", expanded=False):
-            st.write(simulation.surrogate_info)
-            st.dataframe(simulation.model_summary, use_container_width=True, hide_index=True)
+            with st.expander("Traceable hourly results preview", expanded=False):
+                st.dataframe(ts.head(96), use_container_width=True)
 
-        with st.expander("Traceable hourly results preview", expanded=False):
-            st.dataframe(ts.head(96), use_container_width=True)
+            with st.expander("Potentially problematic timesteps", expanded=False):
+                flagged_cols = [
+                    "timestamp",
+                    "renewable_power_mw",
+                    "power_to_electrolyzer_mw",
+                    "h2_produced_kg_per_h",
+                    "h2_to_ptmeoh_kg_per_h",
+                    "unmet_h2_kg_per_h",
+                    "curtailed_power_mw",
+                    "tank_soc_kg_h2",
+                    "surrogate_all_models_in_domain",
+                    "power_deficit_mw",
+                ]
+                flagged_cols = [c for c in flagged_cols if c in ts.columns]
 
-        with st.expander("Potentially problematic timesteps", expanded=False):
-            flagged_cols = [
-                "timestamp",
-                "renewable_power_mw",
-                "power_to_electrolyzer_mw",
-                "h2_produced_kg_per_h",
-                "h2_to_ptmeoh_kg_per_h",
-                "unmet_h2_kg_per_h",
-                "curtailed_power_mw",
-                "tank_soc_kg_h2",
-                "surrogate_all_models_in_domain",
-                "power_deficit_mw",
-            ]
-            flagged_cols = [c for c in flagged_cols if c in ts.columns]
-            flagged = ts[
-                (ts.get("unmet_h2_kg_per_h", 0) > 0)
-                | (ts.get("curtailed_power_mw", 0) > 0)
-                | (ts.get("surrogate_all_models_in_domain", 1) == 0)
-                | (ts.get("power_deficit_mw", 0) > 0)
-            ]
-            st.dataframe(flagged[flagged_cols].head(200), use_container_width=True)
+                unmet_series = ts["unmet_h2_kg_per_h"] if "unmet_h2_kg_per_h" in ts.columns else pd.Series(0, index=ts.index)
+                curtailed_series = ts["curtailed_power_mw"] if "curtailed_power_mw" in ts.columns else pd.Series(0, index=ts.index)
+                in_domain_series = ts["surrogate_all_models_in_domain"] if "surrogate_all_models_in_domain" in ts.columns else pd.Series(1, index=ts.index)
+                deficit_series = ts["power_deficit_mw"] if "power_deficit_mw" in ts.columns else pd.Series(0, index=ts.index)
+
+                flagged = ts[
+                    (unmet_series > 0)
+                    | (curtailed_series > 0)
+                    | (in_domain_series == 0)
+                    | (deficit_series > 0)
+                ]
+
+                st.dataframe(flagged[flagged_cols].head(200), use_container_width=True)
 
 with tab3:
     if optimization is None:
