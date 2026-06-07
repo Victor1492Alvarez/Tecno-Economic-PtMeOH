@@ -653,6 +653,102 @@ def build_balance_bar_chart(ts: pd.DataFrame):
     return fig
 
 
+def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
+    last_error: Exception | None = None
+    for engine in ["openpyxl", "xlsxwriter"]:
+        output = BytesIO()
+        try:
+            with pd.ExcelWriter(output, engine=engine) as writer:
+                df.to_excel(writer, index=False, sheet_name=sheet_name)
+            output.seek(0)
+            return output.getvalue()
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        f"Excel export failed because no supported writer engine is available. Last error: {last_error}"
+    )
+
+
+def build_kpi_export_dataframe(kpis: dict) -> pd.DataFrame:
+    main_kpis = [
+        ("annual_methanol_t", kpis.get("annual_methanol_t")),
+        ("electrolyzer_full_load_hours_h", kpis.get("electrolyzer_full_load_hours_h")),
+        ("ptmeoh_utilization_factor", kpis.get("ptmeoh_utilization_factor")),
+        ("renewable_utilization_fraction", kpis.get("renewable_utilization_fraction")),
+        ("lcomeoh_usd_per_t_meoh", kpis.get("lcomeoh_usd_per_t_meoh")),
+        ("npv_usd", kpis.get("npv_usd")),
+    ]
+
+    diagnostic_kpis = [
+        ("surrogate_out_of_domain_fraction", kpis.get("surrogate_out_of_domain_fraction")),
+        ("curtailment_fraction", kpis.get("curtailment_fraction")),
+        ("h2_not_supplied_t", kpis.get("h2_not_supplied_t")),
+        ("runtime_models_fraction", kpis.get("runtime_models_fraction")),
+        ("tank_empty_hours", kpis.get("tank_empty_hours")),
+        ("tank_full_hours", kpis.get("tank_full_hours")),
+        ("curtailed_hours", kpis.get("curtailed_hours")),
+        ("annual_total_electricity_mwh", kpis.get("annual_total_electricity_mwh")),
+    ]
+
+    rows = []
+    for metric_name, value in main_kpis:
+        rows.append(
+            {
+                "group": "main_kpi",
+                "metric": metric_name,
+                "value": value,
+            }
+        )
+
+    for metric_name, value in diagnostic_kpis:
+        rows.append(
+            {
+                "group": "diagnostic_kpi",
+                "metric": metric_name,
+                "value": value,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_case_inputs_export_dataframe(
+    case_payload: dict,
+    effective_profile_meta: dict,
+    profile_diag: dict,
+) -> pd.DataFrame:
+    rows = []
+
+    for key, value in case_payload.items():
+        rows.append(
+            {
+                "group": "case_input",
+                "parameter": key,
+                "value": value,
+            }
+        )
+
+    for key, value in effective_profile_meta.items():
+        rows.append(
+            {
+                "group": "profile_meta",
+                "parameter": key,
+                "value": value,
+            }
+        )
+
+    for key, value in profile_diag.items():
+        rows.append(
+            {
+                "group": "profile_diagnostic",
+                "parameter": key,
+                "value": value,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
 render_flash_message()
 
 active_profile_df = st.session_state.get("renewable_profile_df")
@@ -1271,6 +1367,26 @@ with tab2:
         kpis = getattr(simulation, "kpis", {})
         ts = getattr(simulation, "time_series", pd.DataFrame())
 
+        export_stub = (
+            f"ptmeoh_{slugify(scenario_name)}_{slugify(operating_mode)}_{slugify(active_profile_name)}"
+        )
+
+        kpi_export_df = build_kpi_export_dataframe(kpis)
+        case_inputs_export_df = build_case_inputs_export_dataframe(
+            case_payload=case_payload,
+            effective_profile_meta=effective_profile_meta,
+            profile_diag=profile_diag,
+        )
+
+        kpi_excel_bytes = dataframe_to_excel_bytes(
+            kpi_export_df,
+            sheet_name="annual_simulation_kpis",
+        )
+        case_inputs_excel_bytes = dataframe_to_excel_bytes(
+            case_inputs_export_df,
+            sheet_name="case_inputs",
+        )
+
         st.subheader("Main KPIs")
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Annual MeOH [t/y]", f"{kpis.get('annual_methanol_t', float('nan')):,.3f}")
@@ -1292,6 +1408,33 @@ with tab2:
         d6.metric("Tank full hours [h/y]", f"{kpis.get('tank_full_hours', float('nan')):,.1f}")
         d7.metric("Curtailed hours [h/y]", f"{kpis.get('curtailed_hours', float('nan')):,.1f}")
         d8.metric("Annual total electricity [MWh/y]", f"{kpis.get('annual_total_electricity_mwh', float('nan')):,.3f}")
+
+        with st.expander("Export annual simulation review files", expanded=False):
+            st.caption(
+                "Download the KPI summary and the exact case-input snapshot used for this simulation run."
+            )
+
+            export_col1, export_col2 = st.columns(2)
+
+            with export_col1:
+                st.download_button(
+                    label="Download KPI summary (.xlsx)",
+                    data=kpi_excel_bytes,
+                    file_name=f"{export_stub}_annual_simulation_kpis.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+            with export_col2:
+                st.download_button(
+                    label="Download case inputs (.xlsx)",
+                    data=case_inputs_excel_bytes,
+                    file_name=f"{export_stub}_case_inputs.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+            st.dataframe(kpi_export_df, use_container_width=True, hide_index=True)
 
         if not ts.empty:
             st.plotly_chart(
