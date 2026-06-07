@@ -142,13 +142,13 @@ def infer_profile_meta_from_normalized(
 
 
 def normalize_renewable_profile(
-    raw_df: pd.DataFrame,
+    raw_profile_df: pd.DataFrame,
     timestamp_col: str,
     renewable_col: str,
     unit_mode: str,
     expand_daily_to_hourly: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
-    df = raw_df[[timestamp_col, renewable_col]].copy()
+    df = raw_profile_df[[timestamp_col, renewable_col]].copy()
     df.columns = ["timestamp", "raw_value"]
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df["raw_value"] = pd.to_numeric(df["raw_value"], errors="coerce")
