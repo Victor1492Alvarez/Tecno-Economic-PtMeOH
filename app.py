@@ -5,35 +5,40 @@ import json
 from pathlib import Path
 import re
 from zipfile import BadZipFile, ZipFile
-from typing import Callable
 
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from application.case_runner import CaseRunner
 from infrastructure.model_registry import ModelRegistry
 from presentation.plotting import heatmap, line_profile, tornado
 
-ProgressCallback = Callable[[str, int, int], None] | None
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 PERSIST_ROOT = PROJECT_ROOT / "user_data"
 PROFILE_STORE = PERSIST_ROOT / "renewable_profiles"
 MODEL_ARCHIVE_STORE = PERSIST_ROOT / "model_archives"
 
+SCENARIO_PRICE_DEFAULTS_USD_PER_KWH = {
+    "optimistic": 35.0 / 1000.0,
+    "moderate": 55.0 / 1000.0,
+    "pessimistic": 80.0 / 1000.0,
+}
+
 runner = CaseRunner(PROJECT_ROOT)
 registry = ModelRegistry(PROJECT_ROOT)
 
-st.set_page_config(page_title="PtMeOH Sizing Tool V1", layout="wide")
-st.title("PtMeOH Plant Sizing Tool — Version 1")
+st.set_page_config(page_title="PtMeOH Sizing Tool V2", layout="wide")
+st.title("PtMeOH Plant Sizing Tool — Version 2")
 st.caption(
-    "Annual deterministic simulator, multi-surrogate PtMeOH response, "
-    "techno-economics, and grid-search design exploration"
+    "Annual deterministic simulator with surrogate governance, renewable-profile diagnostics, "
+    "pre-run consistency checks, and expanded operational observability."
 )
 
 
 def slugify(text: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", text.strip())
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(text).strip())
     return cleaned.strip("_") or "asset"
 
 
@@ -62,6 +67,16 @@ def render_flash_message() -> None:
         getattr(st, kind)(text)
 
 
+def get_scenario_price_default(scenario_name: str) -> float:
+    runner_cfg = getattr(runner, "scenario_config", None)
+    if isinstance(runner_cfg, dict):
+        try:
+            return float(runner_cfg[scenario_name]["electricity_price_usd_per_mwh"]) / 1000.0
+        except Exception:
+            pass
+    return SCENARIO_PRICE_DEFAULTS_USD_PER_KWH.get(scenario_name, SCENARIO_PRICE_DEFAULTS_USD_PER_KWH["moderate"])
+
+
 def read_tabular_file(uploaded_file) -> pd.DataFrame:
     suffix = Path(uploaded_file.name).suffix.lower()
     if suffix in [".csv", ".txt"]:
@@ -76,7 +91,7 @@ def read_tabular_file(uploaded_file) -> pd.DataFrame:
 
 
 def choose_default_column(columns: list[str], keywords: list[str]) -> int:
-    lowered = [c.lower() for c in columns]
+    lowered = [str(c).lower() for c in columns]
     for kw in keywords:
         for idx, col in enumerate(lowered):
             if kw in col:
@@ -84,12 +99,55 @@ def choose_default_column(columns: list[str], keywords: list[str]) -> int:
     return 0
 
 
+def infer_profile_meta_from_normalized(
+    df: pd.DataFrame,
+    source_name: str,
+    source_kind: str,
+    raw_rows: int | None = None,
+    unit_mode: str | None = None,
+    expanded_to_hourly: bool | None = None,
+) -> dict:
+    if df is None or df.empty:
+        return {
+            "source_name": source_name,
+            "source_kind": source_kind,
+            "raw_rows": raw_rows or 0,
+            "normalized_rows": 0,
+            "median_step_h": None,
+            "looks_daily": False,
+            "expanded_to_hourly": bool(expanded_to_hourly),
+            "unit_mode": unit_mode,
+        }
+
+    diffs_h = (
+        df["timestamp"].diff().dropna().dt.total_seconds().div(3600.0)
+        if len(df) > 1
+        else pd.Series(dtype=float)
+    )
+    median_step_h = float(diffs_h.median()) if not diffs_h.empty else 1.0
+    looks_daily = median_step_h >= 23.0
+
+    return {
+        "source_name": source_name,
+        "source_kind": source_kind,
+        "raw_rows": int(raw_rows or len(df)),
+        "normalized_rows": int(len(df)),
+        "median_step_h": median_step_h,
+        "looks_daily": looks_daily,
+        "expanded_to_hourly": bool(expanded_to_hourly),
+        "unit_mode": unit_mode,
+        "start": str(df["timestamp"].min()),
+        "end": str(df["timestamp"].max()),
+    }
+
+
 def normalize_renewable_profile(
     raw_df: pd.DataFrame,
     timestamp_col: str,
     renewable_col: str,
     unit_mode: str,
-) -> pd.DataFrame:
+    expand_daily_to_hourly: bool = True,
+) -> tuple[pd.DataFrame, dict]:
     df = raw_df[[timestamp_col, renewable_col]].copy()
     df.columns = ["timestamp", "raw_value"]
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -133,7 +191,8 @@ def normalize_renewable_profile(
 
     df["renewable_power_mw"] = df["renewable_power_mw"].clip(lower=0.0)
 
-    if looks_daily:
+    expanded_to_hourly = False
+    if looks_daily and expand_daily_to_hourly:
         expanded_rows: list[dict] = []
         for _, row in df.iterrows():
             day_start = row["timestamp"].normalize()
@@ -145,11 +204,25 @@ def normalize_renewable_profile(
                     }
                 )
         out = pd.DataFrame(expanded_rows)
+        expanded_to_hourly = True
     else:
         out = df[["timestamp", "renewable_power_mw"]].copy()
 
     out = out.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
-    return out
+
+    meta = {
+        "source_name": "uploaded_profile",
+        "source_kind": "uploaded",
+        "raw_rows": int(len(df)),
+        "normalized_rows": int(len(out)),
+        "median_step_h": median_step_h,
+        "looks_daily": bool(looks_daily),
+        "expanded_to_hourly": bool(expanded_to_hourly),
+        "unit_mode": unit_mode,
+        "start": str(out["timestamp"].min()),
+        "end": str(out["timestamp"].max()),
+    }
+    return out, meta
 
 
 def save_profile_assets(
@@ -215,7 +288,6 @@ def install_model_zip(
             filename = Path(member.filename).name
             if not filename:
                 continue
-
             destination = target_dir / filename
             with zf.open(member) as src, open(destination, "wb") as dst:
                 dst.write(src.read())
@@ -233,35 +305,210 @@ def install_model_zip(
     }
 
 
-def run_simulation(case, progress_callback: ProgressCallback = None):
-    return runner.run_simulation(case, progress_callback=progress_callback)
+def run_simulation(case):
+    return runner.engine.run(case)
 
 
-def run_optimization(case, progress_callback: ProgressCallback = None):
-    return runner.run_optimization(case, progress_callback=progress_callback)
+def run_optimization(case):
+    return runner.optimizer.run(case)
 
 
 def run_sensitivities(case):
-    return runner.run_sensitivity(case)
+    return runner.sensitivity.run(case)
 
 
-def run_all_workflows(
-    case,
-    run_optimization_flag: bool = True,
-    run_sensitivity_flag: bool = True,
-    progress_callback: ProgressCallback = None,
-):
-    return runner.run_all(
-        case,
-        run_optimization=run_optimization_flag,
-        run_sensitivity=run_sensitivity_flag,
-        progress_callback=progress_callback,
+def build_profile_diagnostics(profile_df: pd.DataFrame, electrolyzer_power_mw: float, min_load_fraction: float) -> dict:
+    peak_mw = float(profile_df["renewable_power_mw"].max()) if not profile_df.empty else 0.0
+    mean_mw = float(profile_df["renewable_power_mw"].mean()) if not profile_df.empty else 0.0
+    annual_energy_gwh_equiv = float(profile_df["renewable_power_mw"].sum() / 1000.0) if not profile_df.empty else 0.0
+    min_load_mw = float(electrolyzer_power_mw * min_load_fraction)
+    below_min_mask = (
+        profile_df["renewable_power_mw"] < min_load_mw if not profile_df.empty else pd.Series(dtype=bool)
     )
+    below_min_fraction = float(below_min_mask.mean()) if len(below_min_mask) > 0 else 0.0
+    zero_power_fraction = float((profile_df["renewable_power_mw"] <= 1e-9).mean()) if not profile_df.empty else 0.0
+    severe_scale_mismatch = peak_mw < 0.20 * float(electrolyzer_power_mw)
+    likely_non_operational = below_min_fraction > 0.50
+
+    return {
+        "peak_mw": peak_mw,
+        "mean_mw": mean_mw,
+        "annual_energy_gwh_equiv": annual_energy_gwh_equiv,
+        "electrolyzer_nominal_power_mw": float(electrolyzer_power_mw),
+        "electrolyzer_min_load_fraction": float(min_load_fraction),
+        "electrolyzer_min_load_mw": min_load_mw,
+        "below_min_load_fraction": below_min_fraction,
+        "zero_power_fraction": zero_power_fraction,
+        "severe_scale_mismatch": severe_scale_mismatch,
+        "likely_non_operational": likely_non_operational,
+    }
+
+
+def collect_bundle_issues(filtered_catalog: pd.DataFrame) -> list[str]:
+    issues: list[str] = []
+    if filtered_catalog is None or filtered_catalog.empty:
+        issues.append("No model bundles were detected for the selected surrogate library.")
+        return issues
+
+    if "ready_for_runtime" in filtered_catalog.columns:
+        incomplete = filtered_catalog[filtered_catalog["ready_for_runtime"] != True].copy()
+        for _, row in incomplete.iterrows():
+            model_name = row.get("model_name", "unknown_model")
+            missing = row.get("missing_files", "")
+            if pd.isna(missing):
+                missing = ""
+            issues.append(f"{model_name}: missing runtime artifacts -> {missing or 'unspecified'}")
+
+    if "model_name" in filtered_catalog.columns and "ready_for_runtime" in filtered_catalog.columns:
+        prod_mask = filtered_catalog["model_name"].astype(str).eq("Model_Prod_MeOH")
+        if prod_mask.any():
+            prod_ready = bool(filtered_catalog.loc[prod_mask, "ready_for_runtime"].iloc[0])
+            if not prod_ready:
+                issues.append(
+                    "Model_Prod_MeOH is incomplete; methanol output may rely on fallback estimation rather than the dedicated surrogate."
+                )
+        else:
+            issues.append("Model_Prod_MeOH is not listed in the selected surrogate library catalog.")
+
+    return issues
+
+
+def build_pre_run_messages(case, profile_meta: dict | None, profile_diag: dict, filtered_catalog: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    infos: list[str] = []
+
+    if case.ptmeoh.target_h2_feed_kg_per_h > case.ptmeoh.max_h2_feed_kg_per_h:
+        errors.append(
+            "Target H2 feed is greater than PtMeOH maximum intake. Reduce the target or increase the maximum intake before running."
+        )
+
+    if profile_meta and profile_meta.get("looks_daily") and profile_meta.get("expanded_to_hourly"):
+        infos.append(
+            f"Loaded renewable profile was detected as daily data and expanded from {profile_meta.get('raw_rows')} rows to {profile_meta.get('normalized_rows')} hourly rows."
+        )
+
+    if profile_diag["severe_scale_mismatch"]:
+        warnings.append(
+            f"Renewable peak power ({profile_diag['peak_mw']:.3f} MW) is far below electrolyzer nominal power ({profile_diag['electrolyzer_nominal_power_mw']:.3f} MW)."
+        )
+
+    if profile_diag["likely_non_operational"]:
+        warnings.append(
+            f"Renewable availability is below electrolyzer minimum load ({profile_diag['electrolyzer_min_load_mw']:.3f} MW) during "
+            f"{100.0 * profile_diag['below_min_load_fraction']:.1f}% of the profile, so the electrolyzer may remain off for much of the year."
+        )
+
+    if profile_diag["mean_mw"] < 0.10 * profile_diag["electrolyzer_nominal_power_mw"]:
+        warnings.append(
+            f"Average renewable power ({profile_diag['mean_mw']:.3f} MW) is very low relative to electrolyzer nominal power "
+            f"({profile_diag['electrolyzer_nominal_power_mw']:.3f} MW)."
+        )
+
+    bundle_issues = collect_bundle_issues(filtered_catalog)
+    warnings.extend(bundle_issues)
+
+    return errors, warnings, infos
+
+
+def build_daily_mean_chart(ts: pd.DataFrame, columns: list[str], title: str, y_title: str):
+    if ts.empty:
+        return go.Figure()
+    tmp = ts.copy()
+    tmp["date"] = pd.to_datetime(tmp["timestamp"]).dt.date
+    agg = tmp.groupby("date", as_index=False)[columns].mean(numeric_only=True)
+    fig = go.Figure()
+    palette = ["#0b7285", "#2f9e44", "#4dabf7", "#6b7f86", "#8ca6ad"]
+    for idx, col in enumerate(columns):
+        if col in agg.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=agg["date"],
+                    y=agg[col],
+                    mode="lines",
+                    name=col,
+                    line=dict(color=palette[idx % len(palette)], width=2),
+                )
+            )
+    fig.update_layout(
+        title=title,
+        paper_bgcolor="#f4f8f8",
+        plot_bgcolor="white",
+        yaxis_title=y_title,
+        legend_orientation="h",
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
+    return fig
+
+
+def build_diagnostic_event_chart(ts: pd.DataFrame):
+    if ts.empty:
+        return go.Figure()
+    tmp = ts.copy()
+    tmp["date"] = pd.to_datetime(tmp["timestamp"]).dt.date
+    daily = tmp.groupby("date", as_index=False).agg(
+        unmet_h2_kg_per_d=("unmet_h2_kg_per_h", "sum"),
+        curtailed_power_mwh_per_d=("curtailed_power_mw", "sum"),
+        out_of_domain_hours=("surrogate_all_models_in_domain", lambda s: int((1 - s).sum())),
+    )
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=daily["date"],
+            y=daily["unmet_h2_kg_per_d"],
+            name="unmet_h2_kg_per_d",
+            marker_color="#a12c7b",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=daily["date"],
+            y=daily["curtailed_power_mwh_per_d"],
+            name="curtailed_power_mwh_per_d",
+            marker_color="#da7101",
+        )
+    )
+    fig.update_layout(
+        barmode="group",
+        title="Daily diagnostic events — unmet H2 and renewable curtailment",
+        paper_bgcolor="#f4f8f8",
+        plot_bgcolor="white",
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
+    return fig
+
+
+def build_balance_bar_chart(ts: pd.DataFrame):
+    if ts.empty:
+        return go.Figure()
+
+    records = [
+        {"metric": "Renewable available [MWh/y]", "value": float(ts["renewable_power_mw"].sum())},
+        {"metric": "Renewable used [MWh/y]", "value": float(ts["renewable_used_mw"].sum())},
+        {"metric": "Electrolyzer power [MWh/y]", "value": float(ts["power_to_electrolyzer_mw"].sum())},
+        {"metric": "Downstream aux power [MWh/y]", "value": float(ts["downstream_aux_power_mw"].sum())},
+        {"metric": "Curtailed power [MWh/y]", "value": float(ts["curtailed_power_mw"].sum())},
+        {"metric": "H2 produced [kg/y]", "value": float(ts["h2_produced_kg_per_h"].sum())},
+        {"metric": "H2 to PtMeOH [kg/y]", "value": float(ts["h2_to_ptmeoh_kg_per_h"].sum())},
+        {"metric": "Unmet H2 [kg/y]", "value": float(ts["unmet_h2_kg_per_h"].sum())},
+    ]
+    df = pd.DataFrame(records)
+    fig = px.bar(
+        df,
+        x="value",
+        y="metric",
+        orientation="h",
+        title="Annual balance overview",
+        color_discrete_sequence=["#0b7285"],
+    )
+    fig.update_layout(paper_bgcolor="#f4f8f8", plot_bgcolor="white", margin=dict(l=20, r=20, t=50, b=20))
+    return fig
 
 
 render_flash_message()
 
 active_profile_df = st.session_state.get("renewable_profile_df")
+active_profile_meta = st.session_state.get("renewable_profile_meta")
 active_profile_name = st.session_state.get("renewable_profile_name", "default_synthetic_profile")
 
 with st.sidebar:
@@ -280,17 +527,14 @@ with st.sidebar:
         index=1,
     )
 
-    default_electricity_price_usd_per_kwh = (
-        float(runner.scenario_config[scenario_name]["electricity_price_usd_per_mwh"]) / 1000.0
-    )
-
+    default_electricity_price_usd_per_kwh = get_scenario_price_default(scenario_name)
     electricity_price_usd_per_kwh = st.number_input(
         "Electricity price [USD/kWh]",
         min_value=0.0,
-        value=default_electricity_price_usd_per_kwh,
+        value=float(default_electricity_price_usd_per_kwh),
         step=0.001,
         format="%.4f",
-        help="This value overrides the electricity-price assumption of the selected techno-economic scenario for the current case.",
+        help="This value overrides the electricity-price assumption of the selected scenario for the current case.",
     )
 
     electrolyzer_power_mw = st.number_input(
@@ -336,9 +580,8 @@ with st.sidebar:
         step=10.0,
         format="%.3f",
         help=(
-            "Dispatch target to the downstream PtMeOH section. "
-            "The simulator tries to deliver this hourly H2 flow to the methanol train; "
-            "if renewable production is insufficient, the H2 buffer discharges first and any remaining deficit becomes unmet H2."
+            "Hourly H2 delivery target for the methanol train. If renewable production is insufficient, "
+            "the tank discharges first and any remaining deficit becomes unmet H2."
         ),
     )
 
@@ -349,19 +592,15 @@ with st.sidebar:
         step=10.0,
         format="%.3f",
         help=(
-            "Hard upper bound on how much H2 the downstream PtMeOH train can physically absorb. "
-            "This caps reactor/compression throughput, methanol production and the electricity consumption predicted by downstream compressor models."
+            "Hard upper bound on how much H2 the downstream PtMeOH train can physically absorb."
         ),
     )
 
     with st.expander("Explain downstream H2 variables", expanded=False):
         st.markdown(
             """
-- **Target H2 feed to PtMeOH [kg/h]**: hourly H2 delivery target for the methanol train.  
-  It affects storage dispatch, unmet-H2 events, PtMeOH utilization and all surrogate outputs.
-
-- **Maximum PtMeOH H2 intake [kg/h]**: downstream processing ceiling.  
-  It limits the H2 that can actually enter the PtMeOH block, so it caps methanol output and the auxiliary electric demand estimated by C1, C2 and C3.
+- **Target H2 feed to PtMeOH [kg/h]**: hourly H2 delivery target for the methanol train.
+- **Maximum PtMeOH H2 intake [kg/h]**: downstream processing ceiling that caps actual H2 intake.
             """
         )
 
@@ -384,8 +623,10 @@ with st.sidebar:
             format="%.3f",
         )
         st.session_state["renewable_profile_df"] = None
+        st.session_state["renewable_profile_meta"] = None
         st.session_state["renewable_profile_name"] = "default_synthetic_profile"
         active_profile_df = None
+        active_profile_meta = None
         active_profile_name = "default_synthetic_profile"
 
     elif profile_source == "Upload renewable profile file":
@@ -425,18 +666,28 @@ with st.sidebar:
                     ["MW", "kW", "MWh/day", "kWh/day", "MWh/interval", "kWh/interval"],
                     index=0,
                 )
+                expand_daily_to_hourly = st.checkbox(
+                    "Expand daily profile to hourly resolution when daily data is detected",
+                    value=True,
+                )
 
                 st.dataframe(raw_profile_df.head(12), use_container_width=True)
 
                 if st.button("Load this renewable profile", use_container_width=True):
-                    normalized_profile = normalize_renewable_profile(
-                        raw_profile_df,
-                        str(timestamp_col),
-                        str(renewable_col),
-                        str(unit_mode),
+                    normalized_profile, profile_meta = normalize_renewable_profile(
+                        raw_profile_df=raw_profile_df,
+                        timestamp_col=str(timestamp_col),
+                        renewable_col=str(renewable_col),
+                        unit_mode=str(unit_mode),
+                        expand_daily_to_hourly=bool(expand_daily_to_hourly),
                     )
+                    profile_meta["source_name"] = uploaded_profile_file.name
+                    profile_meta["source_kind"] = "uploaded"
+
                     st.session_state["renewable_profile_df"] = normalized_profile
+                    st.session_state["renewable_profile_meta"] = profile_meta
                     st.session_state["renewable_profile_name"] = uploaded_profile_file.name
+
                     save_profile_assets(
                         uploaded_profile_file,
                         normalized_profile,
@@ -445,9 +696,10 @@ with st.sidebar:
                     )
                     flash_message(
                         "success",
-                        f"Renewable profile loaded with {len(normalized_profile)} rows and saved name '{uploaded_profile_file.name}'.",
+                        f"Renewable profile loaded with {len(normalized_profile)} rows from '{uploaded_profile_file.name}'.",
                     )
                     st.rerun()
+
             except Exception as exc:
                 st.error(f"Could not read the renewable profile file: {exc}")
 
@@ -462,7 +714,15 @@ with st.sidebar:
             if st.button("Load saved renewable profile", use_container_width=True):
                 selected_path = next(p for p in saved_profiles if p.name == saved_profile_name)
                 normalized_profile = load_saved_profile(selected_path)
+                profile_meta = infer_profile_meta_from_normalized(
+                    df=normalized_profile,
+                    source_name=saved_profile_name,
+                    source_kind="saved",
+                    raw_rows=len(normalized_profile),
+                    expanded_to_hourly=False,
+                )
                 st.session_state["renewable_profile_df"] = normalized_profile
+                st.session_state["renewable_profile_meta"] = profile_meta
                 st.session_state["renewable_profile_name"] = saved_profile_name
                 flash_message(
                     "success",
@@ -471,6 +731,7 @@ with st.sidebar:
                 st.rerun()
 
     active_profile_df = st.session_state.get("renewable_profile_df")
+    active_profile_meta = st.session_state.get("renewable_profile_meta")
     active_profile_name = st.session_state.get("renewable_profile_name", active_profile_name)
 
     if profile_source != "Synthetic default profile":
@@ -490,39 +751,34 @@ with st.sidebar:
             renewable_peak_power_mw = float(active_profile_df["renewable_power_mw"].max())
 
     st.subheader("Detected model bundles")
-
     catalog_df = registry.discover_packages()
     filtered_catalog = (
         catalog_df[catalog_df["library"] == surrogate_library].copy()
-        if not catalog_df.empty
+        if not catalog_df.empty and "library" in catalog_df.columns
         else pd.DataFrame()
     )
 
     if filtered_catalog.empty:
         st.warning("No configured model names were found for the selected surrogate library.")
     else:
-        st.dataframe(
-            filtered_catalog[
-                [
-                    "model_name",
-                    "joblib_found",
-                    "py_found",
-                    "txt_found",
-                    "ready_for_runtime",
-                    "ready_for_qa",
-                    "missing_files",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+        preferred_cols = [
+            "model_name",
+            "joblib_found",
+            "py_found",
+            "txt_found",
+            "ready_for_runtime",
+            "ready_for_qa",
+            "missing_files",
+        ]
+        present_cols = [c for c in preferred_cols if c in filtered_catalog.columns]
+        st.dataframe(filtered_catalog[present_cols], use_container_width=True, hide_index=True)
 
     model_names = registry.get_models_by_library(surrogate_library)
 
-    with st.expander("Upload Surrogate Model", expanded=False):
+    with st.expander("Upload surrogate model", expanded=False):
         st.caption(
-            "Upload one ZIP per model. The archive is flattened into "
-            "models/packages/<library>/<model_name>/ so the runtime can find .joblib, .py and .txt directly."
+            "Upload one ZIP per model. The archive is flattened into models/packages/<library>/<model>/ "
+            "so the runtime can find .joblib, .py and .txt directly."
         )
 
         if model_names:
@@ -537,12 +793,10 @@ with st.sidebar:
                 accept_multiple_files=False,
                 key=f"zip_uploader_{surrogate_library}_{target_model_name}",
             )
-
-            if st.button("Asign selected model ZIP to model bundle", use_container_width=True):
+            if st.button("Assign selected model ZIP to model bundle", use_container_width=True):
                 if uploaded_model_zip is None:
                     flash_message("error", "Select a ZIP file before pressing upload.")
                     st.rerun()
-
                 try:
                     summary = install_model_zip(
                         PROJECT_ROOT,
@@ -553,10 +807,8 @@ with st.sidebar:
                     )
                     flash_message(
                         "success",
-                        (
-                            f"ZIP extracted into {summary['target_dir']} with "
-                            f"{summary['written_count']} file(s): {', '.join(summary['written_files'])}"
-                        ),
+                        f"ZIP extracted into {summary['target_dir']} with "
+                        f"{summary['written_count']} file(s): {', '.join(summary['written_files'])}",
                     )
                     st.rerun()
                 except BadZipFile:
@@ -565,12 +817,14 @@ with st.sidebar:
                 except Exception as exc:
                     flash_message("error", f"Upload failed: {exc}")
                     st.rerun()
+        else:
+            st.info("No model names are currently registered for the selected library.")
 
     st.toggle(
         "Save uploaded model ZIPs and renewable profile for future iterations",
         value=st.session_state.get("persist_assets", True),
         key="persist_assets",
-        help="When enabled, uploaded model archives and normalized renewable profiles are written to disk under user_data/ for reuse in later sessions.",
+        help="When enabled, uploaded model archives and normalized renewable profiles are written to disk under user_data/.",
     )
 
     confirm_bundle = st.checkbox(
@@ -593,7 +847,7 @@ case_payload = {
     "renewable_profile_name": active_profile_name,
     "renewable_peak_power_mw": renewable_peak_power_mw,
     "electrolyzer_power_mw": electrolyzer_power_mw,
-    "module_count": module_count,
+    "module_count": int(module_count),
     "storage_enabled": storage_enabled,
     "storage_kg_h2": storage_kg_h2,
     "operating_mode": operating_mode,
@@ -619,106 +873,55 @@ case = runner.build_case(
     electricity_price_usd_per_kwh=float(electricity_price_usd_per_kwh),
 )
 
-run_opt_in_run_all = st.checkbox(
-    "Run optimization during Run All",
-    value=True,
-    help="Turn off the grid search when you only want the base simulation.",
+effective_profile_df = case.renewable_profile.copy()
+effective_profile_meta = active_profile_meta
+if effective_profile_meta is None:
+    effective_profile_meta = infer_profile_meta_from_normalized(
+        df=effective_profile_df,
+        source_name="default_synthetic_profile",
+        source_kind="synthetic",
+        raw_rows=len(effective_profile_df),
+        expanded_to_hourly=False,
+    )
+
+profile_diag = build_profile_diagnostics(
+    profile_df=effective_profile_df,
+    electrolyzer_power_mw=float(case.electrolyzer.nominal_power_mw),
+    min_load_fraction=float(case.electrolyzer.min_load_fraction),
 )
-run_sens_in_run_all = st.checkbox(
-    "Run sensitivity during Run All",
-    value=True,
-    help="Turn off sensitivity analysis to reduce execution time.",
+
+pre_errors, pre_warnings, pre_infos = build_pre_run_messages(
+    case=case,
+    profile_meta=effective_profile_meta,
+    profile_diag=profile_diag,
+    filtered_catalog=filtered_catalog,
 )
 
-progress_bar = st.progress(0)
-status_box = st.empty()
-
-def ui_progress(stage: str, current: int, total: int) -> None:
-    safe_total = max(total, 1)
-    pct = min(current / safe_total, 1.0)
-    progress_bar.progress(pct)
-    status_box.info(f"Stage: {stage} | Progress: {current}/{safe_total}")
-
+run_disabled = len(pre_errors) > 0
 
 action_col1, action_col2, action_col3, action_col4 = st.columns(4)
 
 with action_col1:
-    if st.button("Run annual simulation", use_container_width=True):
-        try:
-            progress_bar.progress(0)
-            status_box.info("Running base simulation...")
-            st.session_state["simulation"] = run_simulation(
-                case,
-                progress_callback=ui_progress,
-            )
-            progress_bar.progress(1.0)
-            status_box.success("Base simulation completed.")
-        except Exception as exc:
-            status_box.error(f"Simulation failed: {exc}")
-            st.exception(exc)
+    if st.button("Run annual simulation", use_container_width=True, disabled=run_disabled):
+        with st.spinner("Running annual simulation..."):
+            st.session_state["simulation"] = run_simulation(case)
 
 with action_col2:
-    if st.button("Run optimization", use_container_width=True):
-        try:
-            progress_bar.progress(0)
-            status_box.info("Running grid optimization...")
-            st.session_state["optimization"] = run_optimization(
-                case,
-                progress_callback=ui_progress,
-            )
-            progress_bar.progress(1.0)
-            status_box.success("Optimization completed.")
-        except Exception as exc:
-            status_box.error(f"Optimization failed: {exc}")
-            st.exception(exc)
+    if st.button("Run optimization", use_container_width=True, disabled=run_disabled):
+        with st.spinner("Running grid optimization..."):
+            st.session_state["optimization"] = run_optimization(case)
 
 with action_col3:
-    if st.button("Run sensitivities", use_container_width=True):
-        try:
-            progress_bar.progress(0)
-            status_box.info("Running sensitivity analysis...")
+    if st.button("Run sensitivities", use_container_width=True, disabled=run_disabled):
+        with st.spinner("Running sensitivity analysis..."):
             st.session_state["sensitivities"] = run_sensitivities(case)
-            progress_bar.progress(1.0)
-            status_box.success("Sensitivity analysis completed.")
-        except Exception as exc:
-            status_box.error(f"Sensitivity analysis failed: {exc}")
-            st.exception(exc)
 
 with action_col4:
-    if st.button("Run all", use_container_width=True, type="primary"):
-        try:
-            progress_bar.progress(0)
-            status_box.info("Preparing run...")
-            outputs = run_all_workflows(
-                case,
-                run_optimization_flag=run_opt_in_run_all,
-                run_sensitivity_flag=run_sens_in_run_all,
-                progress_callback=ui_progress,
-            )
-            st.session_state["simulation"] = outputs["simulation"]
-            st.session_state["optimization"] = outputs["optimization"]
-            st.session_state["sensitivities"] = outputs["sensitivity"]
-            progress_bar.progress(1.0)
-            status_box.success("Run completed.")
-        except Exception as exc:
-            status_box.error(f"Run failed: {exc}")
-            st.exception(exc)
-
-with st.expander("Execution diagnostics", expanded=False):
-    st.write("Use this panel to understand what the app is doing during long runs.")
-    st.write(f"Optimization enabled in Run All: {run_opt_in_run_all}")
-    st.write(f"Sensitivity enabled in Run All: {run_sens_in_run_all}")
-    if active_profile_df is not None:
-        st.write(f"Renewable profile rows: {len(active_profile_df)}")
-    else:
-        st.write("Renewable profile rows: synthetic default profile")
-    st.write(
-        "Estimated optimization combinations:",
-        len(case.optimization.electrolyzer_power_grid_mw)
-        * len(case.optimization.storage_grid_kg_h2)
-        * len(case.optimization.target_h2_grid_kg_per_h)
-        * len(case.optimization.module_count_grid),
-    )
+    if st.button("Run all", use_container_width=True, disabled=run_disabled):
+        with st.spinner("Running full workflow..."):
+            st.session_state["simulation"] = run_simulation(case)
+            st.session_state["optimization"] = run_optimization(case)
+            st.session_state["sensitivities"] = run_sensitivities(case)
 
 simulation = st.session_state.get("simulation")
 optimization = st.session_state.get("optimization")
@@ -729,7 +932,7 @@ tab1, tab2, tab3, tab4 = st.tabs(
 )
 
 with tab1:
-    c1, c2, c3 = st.columns([1.1, 1.2, 1.1])
+    c1, c2, c3 = st.columns([1.0, 1.15, 1.25])
 
     with c1:
         st.subheader("Case definition")
@@ -751,26 +954,74 @@ with tab1:
             }
         )
 
+        st.subheader("Pre-run gates")
+        if pre_errors:
+            for msg in pre_errors:
+                st.error(msg)
+        else:
+            st.success("No blocking pre-run issues detected.")
+
+        for msg in pre_warnings:
+            st.warning(msg)
+
+        for msg in pre_infos:
+            st.info(msg)
+
     with c2:
         st.subheader("Model bundle checklist")
-        st.dataframe(filtered_catalog, use_container_width=True, hide_index=True)
+        if filtered_catalog.empty:
+            st.warning("No bundles detected for the selected library.")
+        else:
+            preferred_cols = [
+                "model_name",
+                "ready_for_runtime",
+                "ready_for_qa",
+                "missing_files",
+            ]
+            present_cols = [c for c in preferred_cols if c in filtered_catalog.columns]
+            st.dataframe(filtered_catalog[present_cols], use_container_width=True, hide_index=True)
+
+            if "ready_for_runtime" in filtered_catalog.columns:
+                incomplete = filtered_catalog[filtered_catalog["ready_for_runtime"] != True].copy()
+                if not incomplete.empty:
+                    st.error("Incomplete runtime bundles detected.")
+                    st.dataframe(
+                        incomplete[[c for c in ["model_name", "missing_files"] if c in incomplete.columns]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
     with c3:
         st.subheader("Renewable profile summary")
-        if active_profile_df is None:
-            st.info("Using synthetic renewable profile generated from the selected renewable peak power.")
-        else:
-            st.write(
-                {
-                    "rows": int(len(active_profile_df)),
-                    "start": str(active_profile_df["timestamp"].min()),
-                    "end": str(active_profile_df["timestamp"].max()),
-                    "peak_mw": float(active_profile_df["renewable_power_mw"].max()),
-                    "mean_mw": float(active_profile_df["renewable_power_mw"].mean()),
-                    "annual_energy_gwh_equiv": float(active_profile_df["renewable_power_mw"].sum() / 1000.0),
-                }
-            )
-            st.dataframe(active_profile_df.head(24), use_container_width=True)
+        st.write(
+            {
+                "source_kind": effective_profile_meta.get("source_kind"),
+                "source_name": effective_profile_meta.get("source_name"),
+                "raw_rows": effective_profile_meta.get("raw_rows"),
+                "normalized_rows": effective_profile_meta.get("normalized_rows"),
+                "median_step_h": effective_profile_meta.get("median_step_h"),
+                "looks_daily": effective_profile_meta.get("looks_daily"),
+                "expanded_to_hourly": effective_profile_meta.get("expanded_to_hourly"),
+                "unit_mode": effective_profile_meta.get("unit_mode"),
+                "start": effective_profile_meta.get("start"),
+                "end": effective_profile_meta.get("end"),
+            }
+        )
+
+        st.subheader("Profile-operability diagnostics")
+        st.write(
+            {
+                "peak_mw": round(profile_diag["peak_mw"], 6),
+                "mean_mw": round(profile_diag["mean_mw"], 6),
+                "annual_energy_gwh_equiv": round(profile_diag["annual_energy_gwh_equiv"], 6),
+                "electrolyzer_nominal_power_mw": round(profile_diag["electrolyzer_nominal_power_mw"], 6),
+                "electrolyzer_min_load_mw": round(profile_diag["electrolyzer_min_load_mw"], 6),
+                "below_min_load_fraction": round(profile_diag["below_min_load_fraction"], 6),
+                "zero_power_fraction": round(profile_diag["zero_power_fraction"], 6),
+            }
+        )
+
+        st.dataframe(effective_profile_df.head(24), use_container_width=True)
 
 with tab2:
     if simulation is None:
@@ -779,27 +1030,30 @@ with tab2:
         for warning in simulation.warnings:
             st.warning(warning)
 
+        st.subheader("Main KPIs")
         m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Annual MeOH [t/y]", f"{simulation.kpis['annual_methanol_t']:,.0f}")
-        m2.metric(
-            "Electrolyzer FLH [h/y]",
-            f"{simulation.kpis['electrolyzer_full_load_hours_h']:,.0f}",
-        )
-        m3.metric(
-            "PtMeOH utilization [-]",
-            f"{simulation.kpis['ptmeoh_utilization_factor']:.2f}",
-        )
-        m4.metric(
-            "Renewable utilization [-]",
-            f"{simulation.kpis['renewable_utilization_fraction']:.2f}",
-        )
-        m5.metric(
-            "LCOMeOH [USD/t]",
-            f"{simulation.kpis['lcomeoh_usd_per_t_meoh']:,.1f}",
-        )
-        m6.metric("NPV [USD]", f"{simulation.kpis['npv_usd']:,.0f}")
+        m1.metric("Annual MeOH [t/y]", f"{simulation.kpis['annual_methanol_t']:,.3f}")
+        m2.metric("Electrolyzer FLH [h/y]", f"{simulation.kpis['electrolyzer_full_load_hours_h']:,.1f}")
+        m3.metric("PtMeOH utilization [-]", f"{simulation.kpis['ptmeoh_utilization_factor']:.4f}")
+        m4.metric("Renewable utilization [-]", f"{simulation.kpis['renewable_utilization_fraction']:.4f}")
+        m5.metric("LCOMeOH [USD/t]", f"{simulation.kpis['lcomeoh_usd_per_t_meoh']:,.3f}")
+        m6.metric("NPV [USD]", f"{simulation.kpis['npv_usd']:,.1f}")
+
+        st.subheader("Diagnostic KPIs")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Surrogate out-of-domain [-]", f"{simulation.kpis['surrogate_out_of_domain_fraction']:.4f}")
+        d2.metric("Curtailment fraction [-]", f"{simulation.kpis['curtailment_fraction']:.4f}")
+        d3.metric("Unmet H2 [t/y]", f"{simulation.kpis['h2_not_supplied_t']:,.4f}")
+        d4.metric("Runtime models fraction [-]", f"{simulation.kpis['runtime_models_fraction']:.4f}")
+
+        d5, d6, d7, d8 = st.columns(4)
+        d5.metric("Tank empty hours [h/y]", f"{simulation.kpis['tank_empty_hours']:,.1f}")
+        d6.metric("Tank full hours [h/y]", f"{simulation.kpis['tank_full_hours']:,.1f}")
+        d7.metric("Curtailed hours [h/y]", f"{simulation.kpis['curtailed_hours']:,.1f}")
+        d8.metric("Annual total electricity [MWh/y]", f"{simulation.kpis['annual_total_electricity_mwh']:,.3f}")
 
         ts = simulation.time_series
+
         st.plotly_chart(
             line_profile(
                 ts.iloc[:336],
@@ -809,6 +1063,7 @@ with tab2:
             ),
             use_container_width=True,
         )
+
         st.plotly_chart(
             line_profile(
                 ts.iloc[:336],
@@ -818,6 +1073,7 @@ with tab2:
             ),
             use_container_width=True,
         )
+
         st.plotly_chart(
             line_profile(
                 ts.iloc[:336],
@@ -827,8 +1083,58 @@ with tab2:
             ),
             use_container_width=True,
         )
-        st.subheader("Traceable hourly results preview")
-        st.dataframe(ts.head(48), use_container_width=True)
+
+        st.plotly_chart(
+            build_daily_mean_chart(
+                ts,
+                ["renewable_power_mw", "power_to_electrolyzer_mw", "downstream_aux_power_mw"],
+                "Daily mean power profile — full year",
+                "Power [MW]",
+            ),
+            use_container_width=True,
+        )
+
+        st.plotly_chart(
+            build_daily_mean_chart(
+                ts,
+                ["h2_produced_kg_per_h", "h2_to_ptmeoh_kg_per_h", "unmet_h2_kg_per_h"],
+                "Daily mean H2 profile — full year",
+                "H2 [kg/h]",
+            ),
+            use_container_width=True,
+        )
+
+        st.plotly_chart(build_diagnostic_event_chart(ts), use_container_width=True)
+        st.plotly_chart(build_balance_bar_chart(ts), use_container_width=True)
+
+        with st.expander("Surrogate and runtime diagnostics", expanded=False):
+            st.write(simulation.surrogate_info)
+            st.dataframe(simulation.model_summary, use_container_width=True, hide_index=True)
+
+        with st.expander("Traceable hourly results preview", expanded=False):
+            st.dataframe(ts.head(96), use_container_width=True)
+
+        with st.expander("Potentially problematic timesteps", expanded=False):
+            flagged_cols = [
+                "timestamp",
+                "renewable_power_mw",
+                "power_to_electrolyzer_mw",
+                "h2_produced_kg_per_h",
+                "h2_to_ptmeoh_kg_per_h",
+                "unmet_h2_kg_per_h",
+                "curtailed_power_mw",
+                "tank_soc_kg_h2",
+                "surrogate_all_models_in_domain",
+                "power_deficit_mw",
+            ]
+            flagged_cols = [c for c in flagged_cols if c in ts.columns]
+            flagged = ts[
+                (ts.get("unmet_h2_kg_per_h", 0) > 0)
+                | (ts.get("curtailed_power_mw", 0) > 0)
+                | (ts.get("surrogate_all_models_in_domain", 1) == 0)
+                | (ts.get("power_deficit_mw", 0) > 0)
+            ]
+            st.dataframe(flagged[flagged_cols].head(200), use_container_width=True)
 
 with tab3:
     if optimization is None:
@@ -842,11 +1148,9 @@ with tab3:
                 optimization.best_row.to_frame(name="value"),
                 use_container_width=True,
             )
-            st.success(
-                "Recommended design balances CAPEX, renewable utilization, PtMeOH stability, and storage buffering under the chosen scenario."
-            )
             st.info(
-                "CAPEX vs stability: larger electrolyzers and larger tanks reduce unmet H2 risk, but they can increase capital intensity and leave more underutilized capacity if the renewable profile is not strong enough."
+                "Use the shortlist together with the diagnostic KPIs. A mathematically best row is not automatically a trustworthy row if "
+                "it still shows high out-of-domain fraction, severe curtailment, or low utilization."
             )
 
         with right:
@@ -856,12 +1160,27 @@ with tab3:
             )
 
         st.subheader("Ranked shortlist")
-        st.dataframe(
-            optimization.results.sort_values(
-                ["lcomeoh_usd_per_t_meoh", "warning_count"]
-            ).head(12),
-            use_container_width=True,
-        )
+        shortlist = optimization.results.sort_values(
+            ["lcomeoh_usd_per_t_meoh", "warning_count"]
+        ).copy()
+        priority_cols = [
+            "case_name",
+            "electrolyzer_power_mw",
+            "module_count",
+            "storage_kg_h2",
+            "target_h2_kg_per_h",
+            "annual_methanol_t",
+            "ptmeoh_utilization_factor",
+            "renewable_utilization_fraction",
+            "curtailment_fraction",
+            "surrogate_out_of_domain_fraction",
+            "warning_count",
+            "feasible",
+            "lcomeoh_usd_per_t_meoh",
+            "npv_usd",
+        ]
+        priority_cols = [c for c in priority_cols if c in shortlist.columns]
+        st.dataframe(shortlist[priority_cols].head(20), use_container_width=True)
 
 with tab4:
     if sensitivities is None:
