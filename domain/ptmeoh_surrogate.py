@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 import pandas as pd
 from infrastructure.model_registry import ModelRegistry
 from infrastructure.surrogate_loader import load_surrogate_bundle
@@ -13,10 +13,38 @@ class MultiSurrogateManager:
         self.project_root = Path(project_root)
         self.library_name = library_name
         self.registry = ModelRegistry(self.project_root)
-        get_models = getattr(self.registry, 'get_models_by_library', None) or getattr(self.registry, 'getmodelsbylibrary')
-        self.model_names = get_models(library_name)
+        self.model_names = self._resolve_model_names(library_name)
         self.bundles = {name: load_surrogate_bundle(self.project_root, name, library_name) for name in self.model_names}
         self.domain_min, self.domain_max = self._infer_global_domain()
+
+    def _call_first_available(self, obj: Any, candidate_names: Iterable[str], *args, default=None, **kwargs):
+        for name in candidate_names:
+            fn = getattr(obj, name, None)
+            if callable(fn):
+                return fn(*args, **kwargs)
+        return default
+
+    def _resolve_model_names(self, library_name: str) -> list[str]:
+        names = self._call_first_available(
+            self.registry,
+            ['get_models_by_library', 'getmodelsbylibrary', 'list_models_by_library', 'listmodelsbylibrary'],
+            library_name,
+            default=None,
+        )
+        if names is not None:
+            return list(names)
+        catalog = self._call_first_available(
+            self.registry,
+            ['discover_packages', 'discoverpackages', 'catalog', 'discover'],
+            default=pd.DataFrame(),
+        )
+        if isinstance(catalog, pd.DataFrame) and not catalog.empty:
+            library_col = 'library' if 'library' in catalog.columns else None
+            name_col = 'model_name' if 'model_name' in catalog.columns else ('name' if 'name' in catalog.columns else None)
+            if library_col and name_col:
+                subset = catalog[catalog[library_col] == library_name]
+                return subset[name_col].dropna().astype(str).tolist()
+        return []
 
     def _infer_global_domain(self) -> tuple[float, float]:
         mins, maxs = [], []
@@ -33,13 +61,16 @@ class MultiSurrogateManager:
 
     def _predict_bundle_value(self, bundle, h2_flow_kg_per_h: float) -> tuple[float, float]:
         pred_df = bundle.predict([h2_flow_kg_per_h])
-        pred_val = float(pred_df['Prediction'].iloc[0]) if 'Prediction' in pred_df.columns else float(pred_df.iloc[0, 1])
+        if 'Prediction' in pred_df.columns:
+            pred_val = float(pred_df['Prediction'].iloc[0])
+        else:
+            pred_val = float(pred_df.iloc[0, 1]) if pred_df.shape[1] > 1 else float(pred_df.iloc[0, 0])
         std_val = float(pred_df['Predictive Std'].iloc[0]) if 'Predictive Std' in pred_df.columns else 0.0
         return pred_val, std_val
 
     def _edge_slope(self, bundle, edge: str, span_fraction: float = 0.01) -> float:
-        bmin = float(bundle.domain_min if getattr(bundle, 'domain_min', None) is not None else self.domain_min)
-        bmax = float(bundle.domain_max if getattr(bundle, 'domain_max', None) is not None else self.domain_max)
+        bmin = float(bundle.domain_min) if getattr(bundle, 'domain_min', None) is not None else self.domain_min
+        bmax = float(bundle.domain_max) if getattr(bundle, 'domain_max', None) is not None else self.domain_max
         span = max(bmax - bmin, 1e-6)
         delta = max(span * span_fraction, 1e-6)
         if edge == 'lower':
@@ -50,7 +81,12 @@ class MultiSurrogateManager:
         y1, _ = self._predict_bundle_value(bundle, x1)
         return (y1 - y0) / max(x1 - x0, 1e-9)
 
-    def predict_all(self, h2_flow_kg_per_h: float, allow_soft_extrapolation_below_min: bool = True, soft_extrapolation_margin_fraction: float = 0.03) -> dict[str, Any]:
+    def predict_all(
+        self,
+        h2_flow_kg_per_h: float,
+        allow_soft_extrapolation_below_min: bool = True,
+        soft_extrapolation_margin_fraction: float = 0.03,
+    ) -> dict[str, Any]:
         outputs: dict[str, Any] = {}
         validity_checks: list[bool] = []
         records: list[dict[str, Any]] = []
@@ -76,6 +112,7 @@ class MultiSurrogateManager:
                 hard_out_of_range = True
                 hard_out_any = True
                 eval_mode = 'hard_out_of_range'
+                pred_val, std_val = self._predict_bundle_value(bundle, input_eval)
             elif input_eval < bundle_min:
                 if allow_soft_extrapolation_below_min and input_eval >= lower_soft_limit:
                     pred_edge, std_val = self._predict_bundle_value(bundle, bundle_min)
@@ -87,8 +124,8 @@ class MultiSurrogateManager:
                     if eval_mode != 'hard_out_of_range':
                         eval_mode = 'soft_extrapolated_below_min'
                 else:
-                    pred_edge, std_val = self._predict_bundle_value(bundle, bundle_min)
-                    pred_val = pred_edge
+                    input_eval = bundle_min
+                    pred_val, std_val = self._predict_bundle_value(bundle, input_eval)
                     hard_out_of_range = True
                     hard_out_any = True
                     in_domain = False
@@ -100,7 +137,7 @@ class MultiSurrogateManager:
             validity_checks.append(in_domain)
             if getattr(bundle, 'runtime_mode', '') == 'runtime':
                 runtime_count += 1
-            output_name = bundle.output_column
+            output_name = getattr(bundle, 'output_column', name)
             outputs[output_name] = pred_val
             outputs[f'{output_name}__std'] = std_val
             records.append({
