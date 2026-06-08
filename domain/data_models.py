@@ -35,8 +35,11 @@ class StorageInputs:
 class PtMeOHInputs:
     operating_mode: str
     surrogate_library: str
-    target_h2_feed_kg_per_h: float
-    max_h2_feed_kg_per_h: float
+    surrogate_domain_min_kg_per_h: float
+    surrogate_domain_max_kg_per_h: float
+    fixed_setpoint_kg_per_h: float
+    allow_soft_extrapolation_below_min: bool = True
+    soft_extrapolation_margin_fraction: float = 0.03
     methanol_yield_t_meoh_per_t_h2: float = 7.95
     unmet_h2_warning_threshold: float = 0.10
     curtailment_warning_threshold: float = 0.35
@@ -46,12 +49,13 @@ class PtMeOHInputs:
 class OptimizationInputs:
     electrolyzer_power_grid_mw: List[float]
     storage_grid_kg_h2: List[float]
-    target_h2_grid_kg_per_h: List[float]
     module_count_grid: List[int]
-    objective: str = "min_lcomeoh"
+    objective: str = 'min_lcomeoh'
     min_ptmeoh_utilization: float = 0.70
-    max_unmet_h2_fraction: float = 0.10
+    max_setpoint_gap_fraction: float = 0.10
     max_curtailment_fraction: float = 0.35
+    max_soft_extrapolated_fraction: float = 0.05
+    max_hard_out_of_range_fraction: float = 0.0
 
 @dataclass
 class CaseInputs:
@@ -63,7 +67,7 @@ class CaseInputs:
     optimization: OptimizationInputs
     renewable_profile: pd.DataFrame
     time_step_h: float = 1.0
-    case_name: str = "base_case"
+    case_name: str = 'base_case'
 
 @dataclass
 class SimulationArtifacts:
@@ -78,4 +82,3 @@ class GridSearchArtifacts:
     results: pd.DataFrame
     feasible_results: pd.DataFrame
     best_row: pd.Series
-
