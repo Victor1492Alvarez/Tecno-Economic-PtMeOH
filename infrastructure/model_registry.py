@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
-from typing import Any
+from pathlib import Path
+from typing import Dict, List
 
 import pandas as pd
 
@@ -10,169 +10,155 @@ import pandas as pd
 class ModelRegistry:
     def __init__(self, project_root: Path):
         self.project_root = Path(project_root)
-        self.catalog_path = self.project_root / "models" / "catalog" / "catalog.json"
-        self.package_root = self.project_root / "models" / "packages"
+        self.catalog_path = self.project_root / "catalog.json"
+        self.models_root = self.project_root / "models" / "packages"
 
-    def load_catalog(self) -> dict[str, Any]:
-        if not self.catalog_path.exists():
-            return {"libraries": [], "model_order": [], "models": {}}
-        with open(self.catalog_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+    def _load_catalog_payload(self) -> dict:
+        if self.catalog_path.exists():
+            try:
+                return json.loads(self.catalog_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
 
-    def _meta_libraries(self, meta: dict[str, Any]) -> list[str]:
-        if "libraries" in meta and isinstance(meta["libraries"], list):
-            return [str(x) for x in meta["libraries"]]
-        if "library" in meta and meta["library"]:
-            return [str(meta["library"])]
-        return []
+    def _catalog_library_map(self) -> Dict[str, List[str]]:
+        payload = self._load_catalog_payload()
 
-    def get_library_names(self) -> list[str]:
-        catalog = self.load_catalog()
-        configured = [str(x) for x in catalog.get("libraries", [])]
+        if isinstance(payload, dict):
+            if "libraries" in payload and isinstance(payload["libraries"], dict):
+                out: Dict[str, List[str]] = {}
+                for lib, models in payload["libraries"].items():
+                    if isinstance(models, list):
+                        out[str(lib)] = [str(x) for x in models]
+                    else:
+                        out[str(lib)] = []
+                return out
 
-        discovered = []
-        if self.package_root.exists():
-            discovered = sorted([p.name for p in self.package_root.iterdir() if p.is_dir()])
+            out: Dict[str, List[str]] = {}
+            for key, value in payload.items():
+                if isinstance(value, list):
+                    out[str(key)] = [str(x) for x in value]
+            if out:
+                return out
 
-        names: list[str] = []
-        for item in configured + discovered:
-            if item not in names:
-                names.append(item)
-        return names
+        return {}
 
-    def get_model_order(self) -> list[str]:
-        catalog = self.load_catalog()
-        order = [str(x) for x in catalog.get("model_order", [])]
-        if order:
-            return order
-        return list(catalog.get("models", {}).keys())
+    def _fs_library_map(self) -> Dict[str, List[str]]:
+        out: Dict[str, List[str]] = {}
+        if not self.models_root.exists():
+            return out
 
-    def package_path(self, model_name: str, library_name: str) -> Path:
-        return self.package_root / library_name / model_name
+        for library_dir in sorted([p for p in self.models_root.iterdir() if p.is_dir()]):
+            model_names = sorted([p.name for p in library_dir.iterdir() if p.is_dir()])
+            out[library_dir.name] = model_names
+        return out
 
-    def discover_model_names(self, library_name: str) -> list[str]:
-        lib_root = self.package_root / library_name
-        if not lib_root.exists():
-            return []
-        return sorted([p.name for p in lib_root.iterdir() if p.is_dir()])
+    def _merged_library_map(self) -> Dict[str, List[str]]:
+        catalog_map = self._catalog_library_map()
+        fs_map = self._fs_library_map()
 
-    def get_models_by_library(self, library_name: str) -> list[str]:
-        catalog = self.load_catalog().get("models", {})
-        ordered = [
-            model_name
-            for model_name in self.get_model_order()
-            if library_name in self._meta_libraries(catalog.get(model_name, {}))
-        ]
-        discovered = self.discover_model_names(library_name)
-        extras = [m for m in discovered if m not in ordered]
-        return ordered + extras
+        merged_keys = sorted(set(catalog_map.keys()) | set(fs_map.keys()))
+        merged: Dict[str, List[str]] = {}
 
-    def _first_match(self, pkg: Path, patterns: list[str]) -> Path | None:
-        for pattern in patterns:
-            matches = sorted(pkg.glob(pattern))
-            if matches:
-                return matches[0]
-        return None
+        for key in merged_keys:
+            merged[key] = sorted(set(catalog_map.get(key, []) + fs_map.get(key, [])))
+        return merged
 
-    def package_files(self, model_name: str, library_name: str) -> dict[str, Path | None]:
-        pkg = self.package_path(model_name, library_name)
+    def get_library_names(self) -> List[str]:
+        merged = self._merged_library_map()
+        if merged:
+            return sorted(merged.keys())
+        return ["variable_h2_constant_co2", "variable_h2_variable_co2"]
 
-        if not pkg.exists():
-            return {
-                "joblib": None,
-                "py": None,
-                "txt": None,
-                "metadata": None,
-                "parameters": None,
-                "consolidated_report": None,
-                "training_report": None,
-            }
+    def get_models_by_library(self, library_name: str) -> List[str]:
+        merged = self._merged_library_map()
+        models = merged.get(str(library_name), [])
+        return sorted(models)
 
-        return {
-            "joblib": self._first_match(pkg, [f"{model_name}.joblib", "*.joblib"]),
-            "py": self._first_match(pkg, [f"{model_name}.py", "*.py"]),
-            "txt": self._first_match(pkg, [f"{model_name}.txt", "*.txt"]),
-            "metadata": self._first_match(pkg, ["metadata.json", "*.json"]),
-            "parameters": self._first_match(pkg, ["model_parameters.xlsx", "*.xlsx", "*.xls"]),
-            "consolidated_report": self._first_match(
-                pkg,
-                ["consolidated_model_report.pdf", "*consolidated*.pdf", "*.pdf"],
-            ),
-            "training_report": self._first_match(
-                pkg,
-                ["training_validation_report.pdf", "*training*.pdf", "*.pdf"],
-            ),
-        }
+    def _inspect_bundle(self, library_name: str, model_name: str) -> dict:
+        bundle_dir = self.models_root / str(library_name) / str(model_name)
 
-    def inspect_package(self, model_name: str, library_name: str) -> dict[str, Any]:
-        pkg = self.package_path(model_name, library_name)
-        files = self.package_files(model_name, library_name)
-        file_status = {k: (v is not None and v.exists()) for k, v in files.items()}
-        file_names = {k: (v.name if v is not None else "") for k, v in files.items()}
+        joblib_files = sorted(bundle_dir.glob("*.joblib")) if bundle_dir.exists() else []
+        py_files = sorted(bundle_dir.glob("*.py")) if bundle_dir.exists() else []
+        txt_files = sorted(bundle_dir.glob("*.txt")) if bundle_dir.exists() else []
+
+        joblib_found = len(joblib_files) > 0
+        py_found = len(py_files) > 0
+        txt_found = len(txt_files) > 0
+
+        missing = []
+        if not joblib_found:
+            missing.append(".joblib")
+        if not py_found:
+            missing.append(".py")
+        if not txt_found:
+            missing.append(".txt")
+
+        ready_for_runtime = joblib_found and py_found and txt_found
+        ready_for_qa = py_found and txt_found
 
         return {
-            "model_name": model_name,
-            "library": library_name,
-            "folder_exists": pkg.exists(),
-            "file_status": file_status,
-            "file_names": file_names,
-            "ready_for_runtime": file_status["joblib"] and file_status["py"],
-            "ready_for_qa": all(
-                file_status[k]
-                for k in ["metadata", "parameters", "consolidated_report", "training_report"]
-            ),
-            "missing_files": [name for name, ok in file_status.items() if not ok],
+            "library": str(library_name),
+            "model_name": str(model_name),
+            "bundle_dir": str(bundle_dir),
+            "joblib_found": bool(joblib_found),
+            "py_found": bool(py_found),
+            "txt_found": bool(txt_found),
+            "ready_for_runtime": bool(ready_for_runtime),
+            "ready_for_qa": bool(ready_for_qa),
+            "missing_files": ", ".join(missing),
         }
 
     def discover_packages(self) -> pd.DataFrame:
-        catalog = self.load_catalog().get("models", {})
-        libraries = self.get_library_names()
-        rows = []
+        rows: list[dict] = []
+        merged = self._merged_library_map()
 
-        for library_name in libraries:
-            names = self.get_models_by_library(library_name)
-            for model_name in names:
-                inspected = self.inspect_package(model_name, library_name)
-                meta = catalog.get(model_name, {})
+        for library_name, model_names in merged.items():
+            if not model_names:
                 rows.append(
                     {
-                        "library": library_name,
-                        "model_name": model_name,
-                        "category": meta.get("category", "unknown"),
-                        "unit": meta.get("unit", "unknown"),
-                        "folder_exists": inspected["folder_exists"],
-                        "joblib_found": inspected["file_status"]["joblib"],
-                        "py_found": inspected["file_status"]["py"],
-                        "txt_found": inspected["file_status"]["txt"],
-                        "joblib_file": inspected["file_names"]["joblib"],
-                        "py_file": inspected["file_names"]["py"],
-                        "txt_file": inspected["file_names"]["txt"],
-                        "ready_for_runtime": inspected["ready_for_runtime"],
-                        "ready_for_qa": inspected["ready_for_qa"],
-                        "missing_files": ", ".join(inspected["missing_files"]),
+                        "library": str(library_name),
+                        "model_name": "",
+                        "bundle_dir": str(self.models_root / str(library_name)),
+                        "joblib_found": False,
+                        "py_found": False,
+                        "txt_found": False,
+                        "ready_for_runtime": False,
+                        "ready_for_qa": False,
+                        "missing_files": "no registered models",
                     }
                 )
+                continue
 
-        return pd.DataFrame(rows)
+            for model_name in model_names:
+                rows.append(self._inspect_bundle(library_name, model_name))
 
-    def read_model_parameters(self, model_name: str, library_name: str) -> dict:
-        path = self.package_files(model_name, library_name)["parameters"]
-        if path is None or not path.exists():
-            return {}
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "library",
+                    "model_name",
+                    "bundle_dir",
+                    "joblib_found",
+                    "py_found",
+                    "txt_found",
+                    "ready_for_runtime",
+                    "ready_for_qa",
+                    "missing_files",
+                ]
+            )
 
-        xl = pd.ExcelFile(path)
-        meta_sheet = "Model Metadata" if "Model Metadata" in xl.sheet_names else xl.sheet_names[0]
-        log_sheet = "Temporary Parameter Log" if "Temporary Parameter Log" in xl.sheet_names else None
+        return pd.DataFrame(rows).sort_values(["library", "model_name"]).reset_index(drop=True)
 
-        meta = pd.read_excel(path, sheet_name=meta_sheet)
-        row = meta.iloc[0].to_dict() if not meta.empty else {}
+    # Optional compatibility aliases
+    def catalog(self) -> pd.DataFrame:
+        return self.discover_packages()
 
-        if log_sheet:
-            fold = pd.read_excel(path, sheet_name=log_sheet)
-            if not fold.empty:
-                if "Train X Min" in fold.columns:
-                    row["train_x_min"] = float(fold["Train X Min"].min())
-                if "Train X Max" in fold.columns:
-                    row["train_x_max"] = float(fold["Train X Max"].max())
+    def discover(self) -> pd.DataFrame:
+        return self.discover_packages()
 
-        return row
+    def list_library_names(self) -> List[str]:
+        return self.get_library_names()
+
+    def list_models_by_library(self, library_name: str) -> List[str]:
+        return self.get_models_by_library(library_name)
