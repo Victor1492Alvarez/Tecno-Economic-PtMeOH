@@ -91,21 +91,57 @@ class SurrogateBundle:
 
 
 class RuntimeJoblibPredictor:
-    def __init__(self, bundle_path: Path):
-        bundle = joblib.load(bundle_path)
-        self.model_name = bundle["model_name"]
-        self.input_column = bundle["input_column"]
-        self.output_column = bundle["output_column"]
-        self.scaler = bundle["scaler"]
-        self.gpr = bundle["gpr"]
+    def __init__(self, model_object, model_name: str, input_column: str, output_column: str):
+        self.model_object = model_object
+        self.model_name = model_name
+        self.input_column = input_column
+        self.output_column = output_column
+
+    def _predict_raw(self, arr: np.ndarray):
+        model = self.model_object
+        x_df = pd.DataFrame({self.input_column: arr})
+        x_np = arr.reshape(-1, 1)
+
+        last_exc = None
+        for payload in (x_df, x_np, arr):
+            try:
+                return model.predict(payload)
+            except Exception as exc:
+                last_exc = exc
+
+        raise RuntimeError(f"Model '{self.model_name}' prediction failed: {last_exc}")
 
     def predict(self, h2_flow):
-        arr = np.asarray(h2_flow, dtype=float).reshape(-1, 1)
-        arr_scaled = self.scaler.transform(arr)
-        pred, std = self.gpr.predict(arr_scaled, return_std=True)
+        arr = np.asarray(h2_flow, dtype=float).reshape(-1)
+        raw = self._predict_raw(arr)
+        std = np.zeros_like(arr, dtype=float)
+
+        if isinstance(raw, tuple) and len(raw) >= 2:
+            pred, maybe_std = raw[0], raw[1]
+            pred = np.asarray(pred, dtype=float).reshape(-1)
+            try:
+                std = np.asarray(maybe_std, dtype=float).reshape(-1)
+            except Exception:
+                std = np.zeros_like(pred, dtype=float)
+        elif isinstance(raw, pd.DataFrame):
+            if "Prediction" in raw.columns:
+                pred = raw["Prediction"].to_numpy(dtype=float)
+            else:
+                pred = raw.iloc[:, -1].to_numpy(dtype=float)
+
+            if "Predictive Std" in raw.columns:
+                std = raw["Predictive Std"].to_numpy(dtype=float)
+            else:
+                std = np.zeros_like(pred, dtype=float)
+        else:
+            pred = np.asarray(raw, dtype=float).reshape(-1)
+
+        if len(std) != len(pred):
+            std = np.zeros_like(pred, dtype=float)
+
         return pd.DataFrame(
             {
-                self.input_column: arr.flatten(),
+                self.input_column: arr,
                 "Prediction": pred,
                 "Predictive Std": std,
                 "Model Name": self.model_name,
@@ -114,56 +150,150 @@ class RuntimeJoblibPredictor:
         )
 
 
-class PythonWrapperPredictor:
-    def __init__(self, module_path: Path, module_key: str):
-        spec = importlib.util.spec_from_file_location(module_key, module_path)
-        if not spec or not spec.loader:
-            raise ImportError(f"Could not load module from {module_path}")
+def _safe_parse_scalar(text: str):
+    s = text.strip()
+    if s == "":
+        return s
+    lowered = s.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    try:
+        if "." in s or "e" in lowered:
+            return float(s)
+        return int(s)
+    except Exception:
+        return s
+
+
+def _load_txt_parameters(txt_path: Path) -> dict:
+    if not txt_path.exists():
+        return {}
+
+    text = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
+    if not text:
+        return {}
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    params: dict = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" in stripped:
+            key, value = stripped.split(":", 1)
+        elif "=" in stripped:
+            key, value = stripped.split("=", 1)
+        else:
+            continue
+        params[key.strip()] = _safe_parse_scalar(value)
+    return params
+
+
+def _load_py_metadata(py_path: Path) -> dict:
+    if not py_path.exists():
+        return {}
+
+    try:
+        spec = importlib.util.spec_from_file_location(py_path.stem, py_path)
+        if spec is None or spec.loader is None:
+            return {}
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self.module = module
-
-    def predict(self, h2_flow):
-        result = self.module.predict(h2_flow)
-        if isinstance(result, pd.DataFrame):
-            return result
-        return pd.DataFrame([result])
+        meta = {}
+        for key in [
+            "INPUT_COLUMN",
+            "OUTPUT_COLUMN",
+            "input_column",
+            "output_column",
+            "TRAIN_X_MIN",
+            "TRAIN_X_MAX",
+            "train_x_min",
+            "train_x_max",
+        ]:
+            if hasattr(module, key):
+                meta[key.lower()] = getattr(module, key)
+        return meta
+    except Exception:
+        return {}
 
 
 def load_surrogate_bundle(project_root: Path, model_name: str, library_name: str) -> SurrogateBundle:
+    project_root = Path(project_root)
+    bundle_dir = project_root / "models" / "packages" / library_name / model_name
+
     registry = ModelRegistry(project_root)
-    files = registry.package_files(model_name, library_name)
-    package_status = registry.inspect_package(model_name, library_name)
-    parameters = registry.read_model_parameters(model_name, library_name)
+    catalog = registry.discover_packages()
+    row = None
+    if not catalog.empty and {"library", "model_name"}.issubset(catalog.columns):
+        matched = catalog[
+            (catalog["library"].astype(str) == str(library_name))
+            & (catalog["model_name"].astype(str) == str(model_name))
+        ]
+        if not matched.empty:
+            row = matched.iloc[0].to_dict()
 
-    metadata = {}
-    metadata_path = files["metadata"]
-    if metadata_path is not None and metadata_path.exists():
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    joblib_files = sorted(bundle_dir.glob("*.joblib")) if bundle_dir.exists() else []
+    py_files = sorted(bundle_dir.glob("*.py")) if bundle_dir.exists() else []
+    txt_files = sorted(bundle_dir.glob("*.txt")) if bundle_dir.exists() else []
 
-    predictor = None
-    joblib_path = files["joblib"]
-    py_path = files["py"]
+    ready_for_runtime = bool(row.get("ready_for_runtime")) if isinstance(row, dict) else (
+        bool(joblib_files) and bool(py_files) and bool(txt_files)
+    )
 
-    if joblib_path is not None and joblib_path.exists():
-        predictor = RuntimeJoblibPredictor(joblib_path)
-    elif py_path is not None and py_path.exists():
+    missing_files = []
+    if isinstance(row, dict) and "missing_files" in row:
+        if isinstance(row["missing_files"], str) and row["missing_files"].strip():
+            missing_files = [x.strip() for x in row["missing_files"].split(",") if x.strip()]
+    else:
+        if not joblib_files:
+            missing_files.append(".joblib")
+        if not py_files:
+            missing_files.append(".py")
+        if not txt_files:
+            missing_files.append(".txt")
+
+    metadata = _load_py_metadata(py_files[0]) if py_files else {}
+    parameters = _load_txt_parameters(txt_files[0]) if txt_files else {}
+
+    input_column = str(parameters.get("Input Column") or metadata.get("input_column") or "h2_flow_kg_per_h")
+    output_column = str(parameters.get("Output Column") or metadata.get("output_column") or model_name)
+
+    package_status = {
+        "ready_for_runtime": ready_for_runtime,
+        "missing_files": missing_files,
+    }
+
+    if ready_for_runtime and joblib_files:
         try:
-            predictor = PythonWrapperPredictor(
-                py_path,
-                module_key=f"{library_name}__{model_name}",
+            model_object = joblib.load(joblib_files[0])
+            predictor = RuntimeJoblibPredictor(
+                model_object=model_object,
+                model_name=model_name,
+                input_column=input_column,
+                output_column=output_column,
             )
         except Exception:
             predictor = MockSurrogate(
                 model_name=model_name,
                 library_name=library_name,
-                output_column=str(parameters.get("Output Column") or model_name),
+                input_column=input_column,
+                output_column=output_column,
             )
+            package_status["ready_for_runtime"] = False
+            if ".joblib_load_failed" not in package_status["missing_files"]:
+                package_status["missing_files"].append(".joblib_load_failed")
     else:
         predictor = MockSurrogate(
             model_name=model_name,
             library_name=library_name,
-            output_column=str(parameters.get("Output Column") or model_name),
+            input_column=input_column,
+            output_column=output_column,
         )
 
     return SurrogateBundle(
