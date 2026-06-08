@@ -25,6 +25,7 @@ class GridOptimizer:
         ))
         total_cases = len(combinations)
         self._emit_progress(progress_callback, 'optimization', 0, max(total_cases, 1))
+
         for case_index, (power_mw, storage_kg, module_count) in enumerate(combinations, start=1):
             case = CaseInputs(
                 case_name=f'P{power_mw}_S{storage_kg}_M{module_count}',
@@ -64,7 +65,8 @@ class GridOptimizer:
                 time_step_h=base_case.time_step_h,
             )
             sim = self.engine.run(case)
-            setpoint_gap_fraction = sim.kpis['h2_not_supplied_t'] / max((sim.time_series['ptmeoh_setpoint_kg_per_h'].sum() / 1000.0), 1e-9)
+            annual_requested_h2_t = sim.time_series['ptmeoh_setpoint_kg_per_h'].sum() / 1000.0
+            setpoint_gap_fraction = sim.kpis['h2_not_supplied_t'] / max(annual_requested_h2_t, 1e-9)
             rows.append({
                 'case_name': case.case_name,
                 'electrolyzer_power_mw': power_mw,
@@ -83,6 +85,7 @@ class GridOptimizer:
                 ),
             })
             self._emit_progress(progress_callback, 'optimization', case_index, max(total_cases, 1))
+
         results = pd.DataFrame(rows)
         feasible = results[results['feasible'] == 1].copy()
         if feasible.empty:
