@@ -992,7 +992,6 @@ with st.sidebar:
             )
             renewable_peak_power_mw = float(active_profile_df["renewable_power_mw"].max())
 
-    st.subheader("Detected model bundles")
     catalog_df = registry.discover_packages()
     filtered_catalog = (
         catalog_df[catalog_df["library"] == surrogate_library].copy()
@@ -1000,24 +999,26 @@ with st.sidebar:
         else pd.DataFrame()
     )
 
-    if filtered_catalog.empty:
-        st.warning("No configured model names were found for the selected surrogate library.")
-    else:
-        preferred_cols = [
-            "model_name",
-            "joblib_found",
-            "py_found",
-            "txt_found",
-            "ready_for_runtime",
-            "ready_for_qa",
-            "missing_files",
-        ]
-        present_cols = [c for c in preferred_cols if c in filtered_catalog.columns]
-        st.dataframe(filtered_catalog[present_cols], use_container_width=True, hide_index=True)
-
-    model_names = registry.get_models_by_library(surrogate_library)
-
     with st.expander("Upload surrogate model", expanded=False):
+        st.subheader("Detected model bundles")
+
+        if filtered_catalog.empty:
+            st.warning("No configured model names were found for the selected surrogate library.")
+        else:
+            preferred_cols = [
+                "model_name",
+                "joblib_found",
+                "py_found",
+                "txt_found",
+                "ready_for_runtime",
+                "ready_for_qa",
+                "missing_files",
+            ]
+            present_cols = [c for c in preferred_cols if c in filtered_catalog.columns]
+            st.dataframe(filtered_catalog[present_cols], use_container_width=True, hide_index=True)
+
+        model_names = registry.get_models_by_library(surrogate_library)
+
         st.caption(
             "Upload one ZIP per model. The archive is flattened into models/packages/<library>/<model>/ "
             "so the runtime can find .joblib, .py and .txt directly."
