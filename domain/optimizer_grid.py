@@ -1,34 +1,67 @@
 from __future__ import annotations
+
 import itertools
 from typing import Callable
 import pandas as pd
-from domain.data_models import CaseInputs, ElectrolyzerInputs, GridSearchArtifacts, PtMeOHInputs, StorageInputs
+
+from domain.data_models import (
+    CaseInputs,
+    ElectrolyzerInputs,
+    GridSearchArtifacts,
+    PtMeOHInputs,
+    StorageInputs,
+)
 from domain.simulation_engine import SimulationEngine
 
 ProgressCallback = Callable[[str, int, int], None] | None
 
+
 class GridOptimizer:
     def __init__(self, engine: SimulationEngine):
         self.engine = engine
-        self.logger = getattr(engine, 'logger', None)
+        self.logger = getattr(engine, "logger", None)
 
-    def _emit_progress(self, callback: ProgressCallback, stage: str, current: int, total: int) -> None:
+    def _emit_progress(
+        self,
+        callback: ProgressCallback,
+        stage: str,
+        current: int,
+        total: int,
+    ) -> None:
         if callback is not None:
             callback(stage, current, total)
 
-    def run(self, base_case: CaseInputs, progress_callback: ProgressCallback = None) -> GridSearchArtifacts:
+    def run(
+        self,
+        base_case: CaseInputs,
+        progress_callback: ProgressCallback = None,
+    ) -> GridSearchArtifacts:
         rows: list[dict] = []
-        combinations = list(itertools.product(
-            base_case.optimization.electrolyzer_power_grid_mw,
-            base_case.optimization.storage_grid_kg_h2,
-            base_case.optimization.module_count_grid,
-        ))
+        combinations = list(
+            itertools.product(
+                base_case.optimization.electrolyzer_power_grid_mw,
+                base_case.optimization.storage_grid_kg_h2,
+                base_case.optimization.target_h2_grid_kg_per_h,
+                base_case.optimization.module_count_grid,
+            )
+        )
         total_cases = len(combinations)
-        self._emit_progress(progress_callback, 'optimization', 0, max(total_cases, 1))
+        self._emit_progress(progress_callback, "optimization", 0, max(total_cases, 1))
 
-        for case_index, (power_mw, storage_kg, module_count) in enumerate(combinations, start=1):
+        for case_index, (power_mw, storage_kg, target_h2, module_count) in enumerate(combinations, start=1):
+            if self.logger is not None:
+                self.logger.info(
+                    "Optimization case %s/%s | P=%s MW | S=%s kg | T=%s kg/h | M=%s",
+                    case_index,
+                    total_cases,
+                    power_mw,
+                    storage_kg,
+                    target_h2,
+                    module_count,
+                )
+
             case = CaseInputs(
-                case_name=f'P{power_mw}_S{storage_kg}_M{module_count}',
+                case_name=f"P{power_mw}_S{storage_kg}_T{target_h2}_M{module_count}",
                 scenario_name=base_case.scenario_name,
                 economic=base_case.economic,
                 electrolyzer=ElectrolyzerInputs(
@@ -50,11 +83,8 @@ class GridOptimizer:
                 ptmeoh=PtMeOHInputs(
                     operating_mode=base_case.ptmeoh.operating_mode,
                     surrogate_library=base_case.ptmeoh.surrogate_library,
-                    surrogate_domain_min_kg_per_h=base_case.ptmeoh.surrogate_domain_min_kg_per_h,
-                    surrogate_domain_max_kg_per_h=base_case.ptmeoh.surrogate_domain_max_kg_per_h,
-                    fixed_setpoint_kg_per_h=base_case.ptmeoh.fixed_setpoint_kg_per_h,
-                    allow_soft_extrapolation_below_min=base_case.ptmeoh.allow_soft_extrapolation_below_min,
-                    soft_extrapolation_margin_fraction=base_case.ptmeoh.soft_extrapolation_margin_fraction,
+                    target_h2_feed_kg_per_h=target_h2,
+                    max_h2_feed_kg_per_h=base_case.ptmeoh.max_h2_feed_kg_per_h,
                     methanol_yield_t_meoh_per_t_h2=base_case.ptmeoh.methanol_yield_t_meoh_per_t_h2,
                     unmet_h2_warning_threshold=base_case.ptmeoh.unmet_h2_warning_threshold,
                     curtailment_warning_threshold=base_case.ptmeoh.curtailment_warning_threshold,
@@ -64,31 +94,35 @@ class GridOptimizer:
                 renewable_profile=base_case.renewable_profile,
                 time_step_h=base_case.time_step_h,
             )
+
             sim = self.engine.run(case)
-            annual_requested_h2_t = sim.time_series['ptmeoh_setpoint_kg_per_h'].sum() / 1000.0
-            setpoint_gap_fraction = sim.kpis['h2_not_supplied_t'] / max(annual_requested_h2_t, 1e-9)
-            rows.append({
-                'case_name': case.case_name,
-                'electrolyzer_power_mw': power_mw,
-                'module_count': module_count,
-                'module_size_mw': case.electrolyzer.module_size_mw,
-                'storage_kg_h2': storage_kg,
-                'fixed_setpoint_kg_per_h': sim.kpis['fixed_setpoint_kg_per_h'],
-                **sim.kpis,
-                'warning_count': len(sim.warnings),
-                'feasible': int(
-                    sim.kpis['ptmeoh_utilization_factor'] >= base_case.optimization.min_ptmeoh_utilization
-                    and setpoint_gap_fraction <= base_case.optimization.max_setpoint_gap_fraction
-                    and sim.kpis['curtailment_fraction'] <= base_case.optimization.max_curtailment_fraction
-                    and sim.kpis['soft_extrapolated_fraction'] <= base_case.optimization.max_soft_extrapolated_fraction
-                    and sim.kpis['hard_out_of_range_fraction'] <= base_case.optimization.max_hard_out_of_range_fraction
-                ),
-            })
-            self._emit_progress(progress_callback, 'optimization', case_index, max(total_cases, 1))
+            unmet_fraction = sim.kpis["h2_not_supplied_t"] / max(sim.kpis["annual_methanol_t"], 1e-9)
+            rows.append(
+                {
+                    "case_name": case.case_name,
+                    "electrolyzer_power_mw": power_mw,
+                    "module_count": module_count,
+                    "module_size_mw": case.electrolyzer.module_size_mw,
+                    "storage_kg_h2": storage_kg,
+                    "target_h2_kg_per_h": target_h2,
+                    **sim.kpis,
+                    "warning_count": len(sim.warnings),
+                    "feasible": int(
+                        sim.kpis["ptmeoh_utilization_factor"] >= base_case.optimization.min_ptmeoh_utilization
+                        and unmet_fraction <= base_case.optimization.max_unmet_h2_fraction
+                        and sim.kpis["curtailment_fraction"] <= base_case.optimization.max_curtailment_fraction
+                        and sim.kpis["surrogate_out_of_domain_fraction"] <= 0.0
+                    ),
+                }
+            )
+            self._emit_progress(progress_callback, "optimization", case_index, max(total_cases, 1))
 
         results = pd.DataFrame(rows)
-        feasible = results[results['feasible'] == 1].copy()
+        feasible = results[results["feasible"] == 1].copy()
         if feasible.empty:
             feasible = results.copy()
-        best = feasible.sort_values(['lcomeoh_usd_per_t_meoh', 'warning_count', 'total_capex_usd'], ascending=[True, True, True]).iloc[0]
+        best = feasible.sort_values(
+            ["lcomeoh_usd_per_t_meoh", "warning_count", "total_capex_usd"],
+            ascending=[True, True, True],
+        ).iloc[0]
         return GridSearchArtifacts(results=results, feasible_results=feasible, best_row=best)
