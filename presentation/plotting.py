@@ -3,36 +3,28 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-PALETTE = {
-    "teal": "#0b7285",
-    "green": "#2f9e44",
-    "cyan": "#4dabf7",
-    "slate": "#6b7f86",
-    "dark": "#18333a",
-    "bg": "#f4f8f8"
-}
-
-def line_profile(df: pd.DataFrame, columns: list[str], title: str, y_title: str):
+def lineprofile(df: pd.DataFrame, columns: list[str], title: str, ytitle: str) -> go.Figure:
     fig = go.Figure()
-    colors = [PALETTE["teal"], PALETTE["green"], PALETTE["cyan"], PALETTE["slate"], "#8ca6ad"]
-    for idx, col in enumerate(columns):
+    palette = ['#0b7285', '#2f9e44', '#4dabf7', '#a12c7b', '#da7101']
+    for i, col in enumerate(columns):
         if col in df.columns:
-            fig.add_trace(go.Scatter(x=df["timestamp"], y=df[col], mode="lines", name=col, line=dict(color=colors[idx % len(colors)], width=2)))
-    fig.update_layout(title=title, paper_bgcolor=PALETTE["bg"], plot_bgcolor="white", yaxis_title=y_title, legend_orientation="h", margin=dict(l=20, r=20, t=50, b=20))
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df[col], mode='lines', name=col, line=dict(color=palette[i % len(palette)], width=2)))
+    fig.update_layout(title=title, yaxis_title=ytitle, paper_bgcolor='#f4f8f8', plot_bgcolor='white', margin=dict(l=20, r=20, t=50, b=20), legend=dict(orientation='h'))
     return fig
 
-def heatmap(results: pd.DataFrame, z_col: str = "lcomeoh_usd_per_t_meoh"):
-    pivot = results.pivot_table(index="storage_kg_h2", columns="electrolyzer_power_mw", values=z_col, aggfunc="mean")
-    fig = px.imshow(pivot, aspect="auto", color_continuous_scale=["#d9f0ef", "#8dd3d2", "#0b7285"], labels=dict(color=z_col))
-    fig.update_layout(title=f"Design heatmap — {z_col}", paper_bgcolor=PALETTE["bg"], plot_bgcolor="white")
-    fig.update_xaxes(title="Electrolyzer nominal power [MW]")
-    fig.update_yaxes(title="Usable H2 storage [kg H2]")
+def heatmap(df: pd.DataFrame, z_col: str = 'lcomeoh_usd_per_t_meoh') -> go.Figure:
+    needed = {'electrolyzer_power_mw', 'storage_kg_h2', z_col}
+    if not needed.issubset(set(df.columns)):
+        return go.Figure()
+    pivot = df.pivot_table(index='storage_kg_h2', columns='electrolyzer_power_mw', values=z_col, aggfunc='mean')
+    fig = px.imshow(pivot, aspect='auto', color_continuous_scale='Viridis', labels=dict(x='Electrolyzer power [MW]', y='Storage [kg H2]', color=z_col))
+    fig.update_layout(title=f'Heatmap of {z_col}', paper_bgcolor='#f4f8f8', plot_bgcolor='white', margin=dict(l=20, r=20, t=50, b=20))
     return fig
 
-def tornado(sens: pd.DataFrame):
-    data = sens.groupby("parameter", as_index=False)["lcomeoh_usd_per_t_meoh"].agg(lambda s: s.max() - s.min())
-    data = data.rename(columns={"lcomeoh_usd_per_t_meoh": "impact_usd_per_t_meoh"}).sort_values("impact_usd_per_t_meoh")
-    fig = px.bar(data, x="impact_usd_per_t_meoh", y="parameter", orientation="h", color_discrete_sequence=[PALETTE["green"]])
-    fig.update_layout(title="Sensitivity tornado — LCOMeOH impact", paper_bgcolor=PALETTE["bg"], plot_bgcolor="white", xaxis_title="Impact on LCOMeOH [USD/t MeOH]", yaxis_title="Parameter")
+def tornado(df: pd.DataFrame) -> go.Figure:
+    if df.empty:
+        return go.Figure()
+    metric = 'npv_usd' if 'npv_usd' in df.columns else df.columns[-1]
+    fig = px.bar(df.sort_values(metric), x=metric, y='parameter', orientation='h', color_discrete_sequence=['#0b7285'])
+    fig.update_layout(title='Sensitivity tornado view', paper_bgcolor='#f4f8f8', plot_bgcolor='white', margin=dict(l=20, r=20, t=50, b=20))
     return fig
-
