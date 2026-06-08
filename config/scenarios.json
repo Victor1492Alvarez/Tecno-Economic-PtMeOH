@@ -2,28 +2,28 @@
   "optimistic": {
     "electricity_price_usd_per_mwh": 35.0,
     "co2_price_usd_per_t": 40.0,
-    "methanol_price_usd_per_t": 520.0,
+    "methanol_price_usd_per_t": 420.0,
     "discount_rate": 0.08,
-    "project_years": 15,
+    "project_years": 20,
     "capex_multiplier": 0.90,
     "opex_multiplier": 0.95
   },
   "moderate": {
     "electricity_price_usd_per_mwh": 55.0,
-    "co2_price_usd_per_t": 70.0,
-    "methanol_price_usd_per_t": 430.0,
+    "co2_price_usd_per_t": 60.0,
+    "methanol_price_usd_per_t": 380.0,
     "discount_rate": 0.10,
-    "project_years": 15,
+    "project_years": 20,
     "capex_multiplier": 1.00,
     "opex_multiplier": 1.00
   },
   "pessimistic": {
     "electricity_price_usd_per_mwh": 80.0,
-    "co2_price_usd_per_t": 110.0,
-    "methanol_price_usd_per_t": 360.0,
+    "co2_price_usd_per_t": 90.0,
+    "methanol_price_usd_per_t": 330.0,
     "discount_rate": 0.12,
-    "project_years": 15,
-    "capex_multiplier": 1.12,
-    "opex_multiplier": 1.15
+    "project_years": 20,
+    "capex_multiplier": 1.10,
+    "opex_multiplier": 1.10
   }
 }
