@@ -12,6 +12,9 @@ def lineprofile(df: pd.DataFrame, columns: list[str], title: str, ytitle: str) -
     fig.update_layout(title=title, yaxis_title=ytitle, paper_bgcolor='#f4f8f8', plot_bgcolor='white', margin=dict(l=20, r=20, t=50, b=20), legend=dict(orientation='h'))
     return fig
 
+def line_profile(df: pd.DataFrame, columns: list[str], title: str, ytitle: str) -> go.Figure:
+    return lineprofile(df, columns, title, ytitle)
+
 def heatmap(df: pd.DataFrame, z_col: str = 'lcomeoh_usd_per_t_meoh') -> go.Figure:
     needed = {'electrolyzer_power_mw', 'storage_kg_h2', z_col}
     if not needed.issubset(set(df.columns)):
