@@ -1,37 +1,26 @@
 from __future__ import annotations
-
-import json
+import logging
 from pathlib import Path
-from typing import Any, Callable, Dict
-
 import pandas as pd
-
-from domain.data_models import (
-    CaseInputs,
-    ElectrolyzerInputs,
-    OptimizationInputs,
-    PtMeOHInputs,
-    ScenarioEconomicInputs,
-    StorageInputs,
-)
-from domain.renewable_profile import build_default_hourly_profile
-from domain.simulation_engine import SimulationEngine
+from domain.data_models import CaseInputs, ElectrolyzerInputs, OptimizationInputs, PtMeOHInputs, ScenarioEconomicInputs, StorageInputs
 from domain.optimizer_grid import GridOptimizer
-from domain.sensitivity_analysis import SensitivityAnalyzer
-
-ProgressCallback = Callable[[str, int, int], None] | None
-
+from domain.simulation_engine import SimulationEngine
+from domain.ptmeoh_surrogate import MultiSurrogateManager
 
 class CaseRunner:
     def __init__(self, project_root: Path):
         self.project_root = Path(project_root)
+        self.logger = logging.getLogger('ptmeoh_tool')
         self.engine = SimulationEngine(self.project_root)
         self.optimizer = GridOptimizer(self.engine)
-        self.sensitivity = SensitivityAnalyzer(self.engine)
-        self.logger = getattr(self.engine, "logger", None)
-        self.scenario_config = json.loads(
-            (self.project_root / "config" / "scenarios.json").read_text(encoding="utf-8")
-        )
+        self.scenario_config = {
+            'optimistic': {'electricity_price_usd_per_mwh': 35.0, 'co2_price_usd_per_t': 30.0, 'methanol_price_usd_per_t': 450.0, 'discount_rate': 0.08, 'project_years': 20},
+            'moderate': {'electricity_price_usd_per_mwh': 55.0, 'co2_price_usd_per_t': 60.0, 'methanol_price_usd_per_t': 400.0, 'discount_rate': 0.10, 'project_years': 20},
+            'pessimistic': {'electricity_price_usd_per_mwh': 80.0, 'co2_price_usd_per_t': 90.0, 'methanol_price_usd_per_t': 350.0, 'discount_rate': 0.12, 'project_years': 20},
+        }
+
+    def _synthetic_profile(self, renewable_peak_power_mw: float) -> pd.DataFrame:
+        return self.engine._default_profile(renewable_peak_power_mw)
 
     def build_case(
         self,
@@ -42,146 +31,83 @@ class CaseRunner:
         storage_kg_h2: float,
         operating_mode: str,
         surrogate_library: str,
-        target_h2_kg_per_h: float,
-        max_h2_feed_kg_per_h: float,
         renewable_peak_power_mw: float,
         renewable_profile_df: pd.DataFrame | None = None,
         electricity_price_usd_per_kwh: float | None = None,
+        allow_soft_extrapolation_below_min: bool = True,
+        soft_extrapolation_margin_fraction: float = 0.03,
     ) -> CaseInputs:
-        econ_payload = dict(self.scenario_config[scenario_name])
-
+        scenario = dict(self.scenario_config.get(scenario_name, self.scenario_config['moderate']))
         if electricity_price_usd_per_kwh is not None:
-            econ_payload["electricity_price_usd_per_mwh"] = float(electricity_price_usd_per_kwh) * 1000.0
-
-        econ = ScenarioEconomicInputs(**econ_payload)
-
-        if renewable_profile_df is None:
-            renewable_profile = build_default_hourly_profile(peak_power_mw=float(renewable_peak_power_mw))
-        else:
-            renewable_profile = renewable_profile_df.copy()
-            if "timestamp" in renewable_profile.columns:
-                renewable_profile["timestamp"] = pd.to_datetime(
-                    renewable_profile["timestamp"], errors="coerce"
-                )
-            if "renewable_power_mw" in renewable_profile.columns:
-                renewable_profile["renewable_power_mw"] = pd.to_numeric(
-                    renewable_profile["renewable_power_mw"], errors="coerce"
-                )
-            renewable_profile = renewable_profile.dropna().reset_index(drop=True)
-
-        electrolyzer_power_mw = float(electrolyzer_power_mw)
-        module_count = int(module_count)
-        storage_kg_h2 = float(storage_kg_h2)
-        target_h2_kg_per_h = float(target_h2_kg_per_h)
-        max_h2_feed_kg_per_h = float(max_h2_feed_kg_per_h)
-
-        electrolyzer = ElectrolyzerInputs(
-            nominal_power_mw=electrolyzer_power_mw,
-            module_size_mw=max(electrolyzer_power_mw / max(module_count, 1), 0.1),
-            min_load_fraction=0.15,
-            specific_energy_kwh_per_kg_h2=52.0,
-            capex_usd_per_kw=850.0,
-            fixed_opex_fraction=0.03,
-        )
-
-        storage = StorageInputs(
-            enabled=bool(storage_enabled),
-            usable_capacity_kg_h2=storage_kg_h2,
-            initial_soc_fraction=0.30,
-        )
-
-        ptmeoh = PtMeOHInputs(
-            operating_mode=str(operating_mode),
-            surrogate_library=str(surrogate_library),
-            target_h2_feed_kg_per_h=target_h2_kg_per_h,
-            max_h2_feed_kg_per_h=max_h2_feed_kg_per_h,
-        )
-
-        storage_grid = {
-            0.0 if storage_kg_h2 <= 0 else round(0.5 * storage_kg_h2, 2),
-            round(storage_kg_h2, 2),
-            500.0 if storage_kg_h2 <= 0 else round(1.5 * storage_kg_h2, 2),
-        }
-
-        optimization = OptimizationInputs(
-            electrolyzer_power_grid_mw=sorted(
-                {
-                    round(0.8 * electrolyzer_power_mw, 2),
-                    round(electrolyzer_power_mw, 2),
-                    round(1.2 * electrolyzer_power_mw, 2),
-                }
-            ),
-            storage_grid_kg_h2=sorted(storage_grid),
-            target_h2_grid_kg_per_h=sorted(
-                {
-                    round(0.85 * target_h2_kg_per_h, 2),
-                    round(target_h2_kg_per_h, 2),
-                    round(min(1.15 * target_h2_kg_per_h, max_h2_feed_kg_per_h), 2),
-                }
-            ),
-            module_count_grid=sorted({max(module_count - 1, 1), module_count, module_count + 1}),
-        )
-
+            scenario['electricity_price_usd_per_mwh'] = float(electricity_price_usd_per_kwh) * 1000.0
+        manager = MultiSurrogateManager(self.project_root, surrogate_library)
+        domain_min = float(manager.domain_min)
+        domain_max = float(manager.domain_max)
+        renewable_profile = renewable_profile_df.copy() if renewable_profile_df is not None else self._synthetic_profile(renewable_peak_power_mw)
         return CaseInputs(
-            case_name="base_case",
-            scenario_name=str(scenario_name),
-            economic=econ,
-            electrolyzer=electrolyzer,
-            storage=storage,
-            ptmeoh=ptmeoh,
-            optimization=optimization,
+            scenario_name=scenario_name,
+            case_name='base_case',
+            economic=ScenarioEconomicInputs(**scenario),
+            electrolyzer=ElectrolyzerInputs(
+                nominal_power_mw=float(electrolyzer_power_mw),
+                module_size_mw=max(float(electrolyzer_power_mw) / max(int(module_count), 1), 0.1),
+                min_load_fraction=0.20,
+                specific_energy_kwh_per_kg_h2=50.0,
+                capex_usd_per_kw=800.0,
+                fixed_opex_fraction=0.03,
+            ),
+            storage=StorageInputs(
+                enabled=bool(storage_enabled),
+                usable_capacity_kg_h2=float(storage_kg_h2),
+                initial_soc_fraction=0.50,
+                max_charge_kg_per_h=float(storage_kg_h2) if storage_enabled else 0.0,
+                max_discharge_kg_per_h=float(storage_kg_h2) if storage_enabled else 0.0,
+                capex_usd_per_kg_h2=20.0,
+            ),
+            ptmeoh=PtMeOHInputs(
+                operating_mode=str(operating_mode),
+                surrogate_library=str(surrogate_library),
+                surrogate_domain_min_kg_per_h=domain_min,
+                surrogate_domain_max_kg_per_h=domain_max,
+                fixed_setpoint_kg_per_h=domain_max,
+                allow_soft_extrapolation_below_min=bool(allow_soft_extrapolation_below_min),
+                soft_extrapolation_margin_fraction=float(soft_extrapolation_margin_fraction),
+            ),
+            optimization=OptimizationInputs(
+                electrolyzer_power_grid_mw=sorted({max(10.0, electrolyzer_power_mw * 0.8), electrolyzer_power_mw, electrolyzer_power_mw * 1.2}),
+                storage_grid_kg_h2=sorted({0.0, storage_kg_h2, max(storage_kg_h2 * 1.5, 1000.0)}),
+                module_count_grid=sorted({1, int(module_count), max(int(module_count) + 2, 2)}),
+            ),
             renewable_profile=renewable_profile,
             time_step_h=1.0,
         )
 
-    def run_simulation(
-        self,
-        case: CaseInputs,
-        progress_callback: ProgressCallback = None,
-    ):
-        if self.logger is not None:
-            self.logger.info("Running base simulation")
+    def run_simulation(self, case: CaseInputs, progress_callback=None):
         return self.engine.run(case, progress_callback=progress_callback)
 
-    def run_optimization(
-        self,
-        case: CaseInputs,
-        progress_callback: ProgressCallback = None,
-    ):
-        if self.logger is not None:
-            self.logger.info("Running optimization")
+    def run_optimization(self, case: CaseInputs, progress_callback=None):
         return self.optimizer.run(case, progress_callback=progress_callback)
 
-    def run_sensitivity(self, case: CaseInputs):
-        if self.logger is not None:
-            self.logger.info("Running sensitivity analysis")
-        return self.sensitivity.run(case)
-
-    def run_all(
-        self,
-        case: CaseInputs,
-        run_optimization: bool = True,
-        run_sensitivity: bool = True,
-        progress_callback: ProgressCallback = None,
-    ) -> Dict[str, Any]:
-        outputs: Dict[str, Any] = {}
-        outputs["simulation"] = self.run_simulation(case, progress_callback=progress_callback)
-
-        if run_optimization:
-            outputs["optimization"] = self.run_optimization(case, progress_callback=progress_callback)
-        else:
-            if self.logger is not None:
-                self.logger.info("Optimization skipped by user")
-            outputs["optimization"] = None
-
-        if run_sensitivity:
-            sensitivity_result = self.run_sensitivity(case)
-            outputs["sensitivity"] = sensitivity_result
-            outputs["sensitivities"] = sensitivity_result
-        else:
-            if self.logger is not None:
-                self.logger.info("Sensitivity analysis skipped by user")
-            outputs["sensitivity"] = None
-            outputs["sensitivities"] = None
-
-        return outputs
+    def run_sensitivity(self, case: CaseInputs, progress_callback=None):
+        rows = []
+        base = self.engine.run(case)
+        for i, factor in enumerate([0.8, 0.9, 1.1, 1.2], start=1):
+            perturbed = self.build_case(
+                scenario_name=case.scenario_name,
+                electrolyzer_power_mw=case.electrolyzer.nominal_power_mw * factor,
+                module_count=max(int(round(case.electrolyzer.nominal_power_mw * factor / max(case.electrolyzer.module_size_mw, 0.1))), 1),
+                storage_enabled=case.storage.enabled,
+                storage_kg_h2=case.storage.usable_capacity_kg_h2,
+                operating_mode=case.ptmeoh.operating_mode,
+                surrogate_library=case.ptmeoh.surrogate_library,
+                renewable_peak_power_mw=float(case.renewable_profile['renewable_power_mw'].max()),
+                renewable_profile_df=case.renewable_profile,
+                electricity_price_usd_per_kwh=case.economic.electricity_price_usd_per_mwh / 1000.0,
+                allow_soft_extrapolation_below_min=case.ptmeoh.allow_soft_extrapolation_below_min,
+                soft_extrapolation_margin_fraction=case.ptmeoh.soft_extrapolation_margin_fraction,
+            )
+            sim = self.engine.run(perturbed)
+            rows.append({'parameter': f'electrolyzer_power_x{factor:.1f}', 'lcomeoh_usd_per_t_meoh': sim.kpis['lcomeoh_usd_per_t_meoh'], 'npv_usd': sim.kpis['npv_usd'], 'annual_methanol_t': sim.kpis['annual_methanol_t']})
+            if progress_callback is not None:
+                progress_callback('sensitivity', i, 4)
+        return pd.DataFrame(rows)
