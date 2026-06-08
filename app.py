@@ -1,6 +1,6 @@
 from __future__ import annotations
-import json
 from pathlib import Path
+from typing import Any, Iterable
 import pandas as pd
 import streamlit as st
 from application.case_runner import CaseRunner
@@ -15,6 +15,32 @@ st.set_page_config(page_title='PtMeOH Sizing Tool V3', layout='wide')
 st.title('PtMeOH Plant Sizing Tool — Version 3')
 st.caption('PtMeOH dispatch governed by the surrogate domain, fixed set point at the validated maximum, and controlled extrapolation below the minimum.')
 
+def call_first_available(obj: Any, candidate_names: Iterable[str], *args, default=None, **kwargs):
+    for name in candidate_names:
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            return fn(*args, **kwargs)
+    return default
+
+def safe_discover_catalog() -> pd.DataFrame:
+    result = call_first_available(registry, ['discover_packages', 'discoverpackages', 'catalog', 'discover'], default=pd.DataFrame())
+    return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
+
+def safe_library_names(catalog_df: pd.DataFrame) -> list[str]:
+    names = call_first_available(registry, ['get_library_names', 'getlibrarynames', 'list_library_names', 'listlibrarynames'], default=None)
+    if names is not None:
+        names = [str(x) for x in names]
+        if names:
+            return names
+    if not catalog_df.empty and 'library' in catalog_df.columns:
+        libs = sorted(catalog_df['library'].dropna().astype(str).unique().tolist())
+        if libs:
+            return libs
+    return ['variable_h2_constant_co2', 'variable_h2_variable_co2']
+
+catalog_df = safe_discover_catalog()
+library_names = safe_library_names(catalog_df)
+
 with st.sidebar:
     st.header('Case inputs')
     scenario_name = st.selectbox('Techno-economic scenario', ['optimistic', 'moderate', 'pessimistic'], index=1)
@@ -25,14 +51,10 @@ with st.sidebar:
     storage_enabled = st.toggle('Enable H2 storage', value=True)
     storage_kg_h2 = st.slider('Usable H2 storage capacity [kg H2]', 0.0, 120000.0, 26000.0, 1000.0)
     operating_mode = st.selectbox('PtMeOH operating mode', ['quasi_base_load', 'flexible'])
-    get_libraries = getattr(registry, 'get_library_names', None) or getattr(registry, 'getlibrarynames', None)
-    library_names = get_libraries() if callable(get_libraries) else ['variable_h2_constant_co2', 'variable_h2_variable_co2']
     surrogate_library = st.selectbox('Surrogate model library', library_names, index=0)
     allow_soft_extrapolation_below_min = st.toggle('Allow soft extrapolation below surrogate minimum', value=True)
     soft_extrapolation_margin_fraction = st.slider('Soft extrapolation margin below minimum [%]', 0.0, 10.0, 3.0, 0.5) / 100.0
 
-    discover = getattr(registry, 'discover_packages', None) or getattr(registry, 'discoverpackages', None)
-    catalog_df = discover() if callable(discover) else pd.DataFrame()
     filtered_catalog = catalog_df[catalog_df['library'] == surrogate_library].copy() if not catalog_df.empty and 'library' in catalog_df.columns else pd.DataFrame()
     st.subheader('Detected model bundles')
     if filtered_catalog.empty:
