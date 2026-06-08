@@ -40,10 +40,12 @@ class CaseRunner:
         scenario = dict(self.scenario_config.get(scenario_name, self.scenario_config['moderate']))
         if electricity_price_usd_per_kwh is not None:
             scenario['electricity_price_usd_per_mwh'] = float(electricity_price_usd_per_kwh) * 1000.0
+
         manager = MultiSurrogateManager(self.project_root, surrogate_library)
         domain_min = float(manager.domain_min)
         domain_max = float(manager.domain_max)
         renewable_profile = renewable_profile_df.copy() if renewable_profile_df is not None else self._synthetic_profile(renewable_peak_power_mw)
+
         return CaseInputs(
             scenario_name=scenario_name,
             case_name='base_case',
@@ -90,7 +92,6 @@ class CaseRunner:
 
     def run_sensitivity(self, case: CaseInputs, progress_callback=None):
         rows = []
-        base = self.engine.run(case)
         for i, factor in enumerate([0.8, 0.9, 1.1, 1.2], start=1):
             perturbed = self.build_case(
                 scenario_name=case.scenario_name,
@@ -107,7 +108,12 @@ class CaseRunner:
                 soft_extrapolation_margin_fraction=case.ptmeoh.soft_extrapolation_margin_fraction,
             )
             sim = self.engine.run(perturbed)
-            rows.append({'parameter': f'electrolyzer_power_x{factor:.1f}', 'lcomeoh_usd_per_t_meoh': sim.kpis['lcomeoh_usd_per_t_meoh'], 'npv_usd': sim.kpis['npv_usd'], 'annual_methanol_t': sim.kpis['annual_methanol_t']})
+            rows.append({
+                'parameter': f'electrolyzer_power_x{factor:.1f}',
+                'lcomeoh_usd_per_t_meoh': sim.kpis['lcomeoh_usd_per_t_meoh'],
+                'npv_usd': sim.kpis['npv_usd'],
+                'annual_methanol_t': sim.kpis['annual_methanol_t'],
+            })
             if progress_callback is not None:
                 progress_callback('sensitivity', i, 4)
         return pd.DataFrame(rows)
