@@ -992,76 +992,96 @@ with st.sidebar:
             )
             renewable_peak_power_mw = float(active_profile_df["renewable_power_mw"].max())
 
-    catalog_df = registry.discover_packages()
-    filtered_catalog = (
-        catalog_df[catalog_df["library"] == surrogate_library].copy()
-        if not catalog_df.empty and "library" in catalog_df.columns
-        else pd.DataFrame()
-    )
+catalog_df = registry.discover_packages()
+filtered_catalog = (
+    catalog_df[catalog_df["library"] == surrogate_library].copy()
+    if not catalog_df.empty and "library" in catalog_df.columns
+    else pd.DataFrame()
+)
+model_names = registry.get_models_by_library(surrogate_library)
 
-    with st.expander("Upload surrogate model", expanded=False):
-        st.subheader("Detected model bundles")
+with st.expander("Upload surrogate model", expanded=False):
+    st.subheader("Detected model bundles")
 
-        if filtered_catalog.empty:
-            st.warning("No configured model names were found for the selected surrogate library.")
-        else:
-            preferred_cols = [
-                "model_name",
-                "joblib_found",
-                "py_found",
-                "txt_found",
-                "ready_for_runtime",
-                "ready_for_qa",
-                "missing_files",
-            ]
-            present_cols = [c for c in preferred_cols if c in filtered_catalog.columns]
-            st.dataframe(filtered_catalog[present_cols], use_container_width=True, hide_index=True)
-
-        model_names = registry.get_models_by_library(surrogate_library)
-
-        st.caption(
-            "Upload one ZIP per model. The archive is flattened into models/packages/<library>/<model>/ "
-            "so the runtime can find .joblib, .py and .txt directly."
+    if filtered_catalog.empty:
+        st.warning(
+            "No configured model names were found for the selected surrogate library."
+        )
+    else:
+        preferred_cols = [
+            "model_name",
+            "joblib_found",
+            "py_found",
+            "txt_found",
+            "ready_for_runtime",
+            "ready_for_qa",
+            "missing_files",
+        ]
+        present_cols = [c for c in preferred_cols if c in filtered_catalog.columns]
+        st.dataframe(
+            filtered_catalog[present_cols],
+            use_container_width=True,
+            hide_index=True,
         )
 
-        if model_names:
-            target_model_name = st.selectbox(
-                "Target model bundle",
-                model_names,
-                key=f"target_model_{surrogate_library}",
-            )
-            uploaded_model_zip = st.file_uploader(
-                "Upload model ZIP",
-                type=["zip"],
-                accept_multiple_files=False,
-                key=f"zip_uploader_{surrogate_library}_{target_model_name}",
-            )
-            if st.button("Assign selected model ZIP to model bundle", use_container_width=True):
-                if uploaded_model_zip is None:
-                    flash_message("error", "Select a ZIP file before pressing upload.")
-                    st.rerun()
-                try:
-                    summary = install_model_zip(
-                        PROJECT_ROOT,
-                        surrogate_library,
-                        target_model_name,
-                        uploaded_model_zip,
-                        st.session_state.get("persist_assets", True),
-                    )
-                    flash_message(
-                        "success",
-                        f"ZIP extracted into {summary['target_dir']} with "
-                        f"{summary['written_count']} file(s): {', '.join(summary['written_files'])}",
-                    )
-                    st.rerun()
-                except BadZipFile:
-                    flash_message("error", "The uploaded file is not a valid ZIP archive.")
-                    st.rerun()
-                except Exception as exc:
-                    flash_message("error", f"Upload failed: {exc}")
-                    st.rerun()
-        else:
-            st.info("No model names are currently registered for the selected library.")
+    st.caption(
+        "Upload one ZIP per model. The archive is flattened into "
+        "models/packages/<library>/<model>/ so the runtime can find "
+        ".joblib, .py and .txt directly."
+    )
+
+    if model_names:
+        target_model_name = st.selectbox(
+            "Target model bundle",
+            model_names,
+            key=f"target_model_{surrogate_library}",
+        )
+
+        uploaded_model_zip = st.file_uploader(
+            "Upload model ZIP",
+            type=["zip"],
+            accept_multiple_files=False,
+            key=f"zip_uploader_{surrogate_library}_{target_model_name}",
+            help=(
+                "Select the ZIP file from your device for the chosen bundle. "
+                "The uploaded archive will be extracted into the target model folder."
+            ),
+        )
+
+        upload_clicked = st.button(
+            "Assign selected model ZIP to model bundle",
+            use_container_width=True,
+            key=f"assign_model_zip_{surrogate_library}_{target_model_name}",
+        )
+
+        if upload_clicked:
+            if uploaded_model_zip is None:
+                flash_message("error", "Select a ZIP file before pressing upload.")
+                st.rerun()
+
+            try:
+                summary = install_model_zip(
+                    PROJECT_ROOT,
+                    surrogate_library,
+                    target_model_name,
+                    uploaded_model_zip,
+                    st.session_state.get("persist_assets", True),
+                )
+                flash_message(
+                    "success",
+                    f"ZIP extracted into {summary['target_dir']} with "
+                    f"{summary['written_count']} files: "
+                    f"{', '.join(summary['written_files'])}",
+                )
+                st.rerun()
+            except BadZipFile:
+                flash_message("error", "The uploaded file is not a valid ZIP archive.")
+                st.rerun()
+            except Exception as exc:
+                flash_message("error", f"Upload failed: {exc}")
+                st.rerun()
+    else:
+        st.info("No model names are currently registered for the selected library.")
 
     st.toggle(
         "Save uploaded model ZIPs and renewable profile for future iterations",
