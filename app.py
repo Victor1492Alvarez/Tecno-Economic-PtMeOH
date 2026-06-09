@@ -772,12 +772,7 @@ with st.sidebar:
         "variable_h2_constant_co2",
         "variable_h2_variable_co2",
     ]
-    surrogate_library = st.selectbox(
-    "Surrogate model library",
-    library_names,
-    index=0,
-    key="surrogate_library_select",
-    )
+    
 
     scenario_name = st.selectbox(
         "Techno-economic scenario",
