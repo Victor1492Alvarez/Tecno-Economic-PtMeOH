@@ -21,80 +21,79 @@ class ModelRegistry:
                 return {}
         return {}
 
-   def _catalog_library_map(self) -> Dict[str, List[str]]:
-    payload = self._load_catalog_payload()
+    def _catalog_library_map(self) -> Dict[str, List[str]]:
+        payload = self._load_catalog_payload()
 
-    if not isinstance(payload, dict):
-        return {}
+        if not isinstance(payload, dict):
+            return {}
 
-    # Formato 1:
-    # {
-    #   "libraries": {
-    #       "lib_a": ["m1", "m2"]
-    #   }
-    # }
-    if "libraries" in payload and isinstance(payload["libraries"], dict):
+        # Formato 1:
+        # {
+        #   "libraries": {
+        #       "lib_a": ["m1", "m2"]
+        #   }
+        # }
+        if "libraries" in payload and isinstance(payload["libraries"], dict):
+            out: Dict[str, List[str]] = {}
+            for lib, models in payload["libraries"].items():
+                if isinstance(models, list):
+                    out[str(lib)] = [str(x) for x in models]
+                else:
+                    out[str(lib)] = []
+            if out:
+                return out
+
+        # Formato 2:
+        # {
+        #   "lib_a": ["m1", "m2"]
+        # }
         out: Dict[str, List[str]] = {}
-        for lib, models in payload["libraries"].items():
-            if isinstance(models, list):
-                out[str(lib)] = [str(x) for x in models]
-            else:
-                out[str(lib)] = []
+        for key, value in payload.items():
+            if isinstance(value, list):
+                out[str(key)] = [str(x) for x in value]
         if out:
             return out
 
-    # Formato 2:
-    # {
-    #   "lib_a": ["m1", "m2"]
-    # }
-    out: Dict[str, List[str]] = {}
-    for key, value in payload.items():
-        if isinstance(value, list):
-            out[str(key)] = [str(x) for x in value]
-    if out:
-        return out
+        # Formato 3:
+        # {
+        #   "libraries": ["lib_a", "lib_b"],
+        #   "model_order": [...],
+        #   "models": {
+        #       "m1": {"libraries": ["lib_a", "lib_b"]},
+        #       "m2": {"libraries": ["lib_a"]}
+        #   }
+        # }
+        libraries = payload.get("libraries", [])
+        models = payload.get("models", {})
+        model_order = payload.get("model_order", [])
 
-    # Formato 3:
-    # {
-    #   "libraries": ["lib_a", "lib_b"],
-    #   "model_order": [...],
-    #   "models": {
-    #       "m1": {"libraries": ["lib_a", "lib_b"]},
-    #       "m2": {"libraries": ["lib_a"]}
-    #   }
-    # }
-    libraries = payload.get("libraries", [])
-    models = payload.get("models", {})
-    model_order = payload.get("model_order", [])
+        if isinstance(libraries, list) and isinstance(models, dict):
+            out = {str(lib): [] for lib in libraries}
 
-    if isinstance(libraries, list) and isinstance(models, dict):
-        out = {str(lib): [] for lib in libraries}
+            for model_name, meta in models.items():
+                if not isinstance(meta, dict):
+                    continue
+                model_libraries = meta.get("libraries", [])
+                if not isinstance(model_libraries, list):
+                    continue
+                for lib in model_libraries:
+                    lib = str(lib)
+                    out.setdefault(lib, []).append(str(model_name))
 
-        for model_name, meta in models.items():
-            if not isinstance(meta, dict):
-                continue
-            model_libraries = meta.get("libraries", [])
-            if not isinstance(model_libraries, list):
-                continue
-            for lib in model_libraries:
-                lib = str(lib)
-                out.setdefault(lib, []).append(str(model_name))
+            if isinstance(model_order, list) and model_order:
+                order_index = {str(name): idx for idx, name in enumerate(model_order)}
+                for lib, model_names in out.items():
+                    out[lib] = sorted(
+                        set(model_names),
+                        key=lambda name: (order_index.get(name, 10**9), name),
+                    )
+            else:
+                for lib, model_names in out.items():
+                    out[lib] = sorted(set(model_names))
 
-        if isinstance(model_order, list) and model_order:
-            order_index = {str(name): idx for idx, name in enumerate(model_order)}
-            for lib, model_names in out.items():
-                out[lib] = sorted(
-                    set(model_names),
-                    key=lambda name: (order_index.get(name, 10**9), name),
-                )
-        else:
-            for lib, model_names in out.items():
-                out[lib] = sorted(set(model_names))
+            return out
 
-        return out
-
-    return {}
-
+        return {}
 
     def _fs_library_map(self) -> Dict[str, List[str]]:
         out: Dict[str, List[str]] = {}
@@ -203,7 +202,6 @@ class ModelRegistry:
 
         return pd.DataFrame(rows).sort_values(["library", "model_name"]).reset_index(drop=True)
 
-    # Optional compatibility aliases
     def catalog(self) -> pd.DataFrame:
         return self.discover_packages()
 
