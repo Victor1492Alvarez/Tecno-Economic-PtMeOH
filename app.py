@@ -768,6 +768,7 @@ with st.sidebar:
     "Surrogate model library",
     library_names,
     index=0,
+    key="surrogate_library_select",
     )
 
     scenario_name = st.selectbox(
