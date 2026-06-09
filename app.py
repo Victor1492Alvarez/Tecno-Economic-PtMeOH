@@ -764,13 +764,18 @@ with st.sidebar:
         "variable_h2_constant_co2",
         "variable_h2_variable_co2",
     ]
+    surrogate_library = st.selectbox(
+    "Surrogate model library",
+    library_names,
+    index=0,
+    )
 
     scenario_name = st.selectbox(
         "Techno-economic scenario",
         ["optimistic", "moderate", "pessimistic"],
         index=1,
     )
-
+    
     default_electricity_price_usd_per_kwh = get_scenario_price_default(scenario_name)
     electricity_price_usd_per_kwh = st.number_input(
         "Electricity price [USD/kWh]",
@@ -992,20 +997,35 @@ with st.sidebar:
             )
             renewable_peak_power_mw = float(active_profile_df["renewable_power_mw"].max())
 
-    st.subheader("Detected Model Bundles")
+    st.subheader("Detected model bundles")
 
     catalog_df = registry.discover_packages()
+    catalog_has_library_col = (
+            isinstance(catalog_df, pd.DataFrame)
+            and not catalog_df.empty
+            and "library" in catalog_df.columns
+        )
+
     filtered_catalog = (
-        catalog_df[catalog_df["library"] == surrogate_library].copy()
-        if not catalog_df.empty and "library" in catalog_df.columns
-        else pd.DataFrame()
-    )
-    if filtered_catalog.empty:
-        st.warning("No configured model names were found for the selected surrogate library.")
-    else:
-        st.dataframe(
-            filtered_catalog[
-                [
+            catalog_df.loc[catalog_df["library"].astype(str) == str(surrogate_library)].copy()
+            if catalog_has_library_col
+            else pd.DataFrame()
+        )
+
+    model_names = registry.get_models_by_library(str(surrogate_library)) or []
+
+    with st.expander("Upload surrogate model", expanded=False):
+            if not isinstance(catalog_df, pd.DataFrame) or catalog_df.empty:
+                st.warning("Model registry returned no package catalog.")
+            elif "library" not in catalog_df.columns:
+                st.error("Model registry catalog does not contain the required 'library' column.")
+            elif filtered_catalog.empty:
+                st.warning(
+                    f"No configured model names were found for the selected surrogate library: "
+                    f"{surrogate_library}"
+                )
+            else:
+                preferred_cols = [
                     "model_name",
                     "joblib_found",
                     "py_found",
@@ -1014,71 +1034,83 @@ with st.sidebar:
                     "ready_for_qa",
                     "missing_files",
                 ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-            )
-    model_names = registry.get_models_by_library(surrogate_library)
+                present_cols = [c for c in preferred_cols if c in filtered_catalog.columns]
+                st.dataframe(
+                    filtered_catalog[present_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-    #Victor Alvarez pasted the whole expander "Upload Surrogate Model" from the first version in this section on 09.06.2026
-
-    with st.expander("Upload Surrogate Model", expanded=False):
-        st.caption(
-            "Upload one ZIP per model. The archive is flattened into "
-            "models/packages/<library>/<model_name>/ so the runtime can find .joblib, .py and .txt directly."
-        )
-
-        if model_names:
-            target_model_name = st.selectbox(
-                "Target model bundle",
-                model_names,
-                key=f"target_model_{surrogate_library}",
-            )
-            uploaded_model_zip = st.file_uploader(
-                "Upload model ZIP",
-                type=["zip"],
-                accept_multiple_files=False,
-                key=f"zip_uploader_{surrogate_library}_{target_model_name}",
+            st.caption(
+                "Upload one ZIP per model. The archive is flattened into "
+                "models/packages/<library>/<model>/ so the runtime can find "
+                ".joblib, .py and .txt directly."
             )
 
-            if st.button("Asign selected model ZIP to model bundle", use_container_width=True):
-                if uploaded_model_zip is None:
-                    flash_message("error", "Select a ZIP file before pressing upload.")
-                    st.rerun()
+            if model_names:
+                target_model_name = st.selectbox(
+                    "Target model bundle",
+                    model_names,
+                    key=f"target_model_{surrogate_library}",
+                )
 
-                try:
-                    summary = install_model_zip(
-                        PROJECT_ROOT,
-                        surrogate_library,
-                        target_model_name,
-                        uploaded_model_zip,
-                        st.session_state.get("persist_assets", True),
-                    )
-                    flash_message(
-                        "success",
-                        (
+                uploaded_model_zip = st.file_uploader(
+                    "Upload model ZIP",
+                    type=["zip"],
+                    accept_multiple_files=False,
+                    key=f"zip_uploader_{surrogate_library}_{target_model_name}",
+                    help=(
+                        "Select the ZIP file for the chosen bundle. "
+                        "The archive will be extracted into the target model folder."
+                    ),
+                )
+
+                if st.button(
+                    "Assign selected model ZIP to model bundle",
+                    use_container_width=True,
+                    key=f"assign_model_zip_{surrogate_library}_{target_model_name}",
+                ):
+                    if uploaded_model_zip is None:
+                        flash_message("error", "Select a ZIP file before pressing upload.")
+                        st.rerun()
+
+                    try:
+                        summary = install_model_zip(
+                            PROJECT_ROOT,
+                            str(surrogate_library),
+                            str(target_model_name),
+                            uploaded_model_zip,
+                            st.session_state.get("persist_assets", True),
+                        )
+                        flash_message(
+                            "success",
                             f"ZIP extracted into {summary['target_dir']} with "
-                            f"{summary['written_count']} file(s): {', '.join(summary['written_files'])}"
-                        ),
-                    )
-                    st.rerun()
-                except BadZipFile:
-                    flash_message("error", "The uploaded file is not a valid ZIP archive.")
-                    st.rerun()
-                except Exception as exc:
-                    flash_message("error", f"Upload failed: {exc}")
-                    st.rerun()
+                            f"{summary['written_count']} file(s): "
+                            f"{', '.join(summary['written_files'])}",
+                        )
+                        st.rerun()
+                    except BadZipFile:
+                        flash_message("error", "The uploaded file is not a valid ZIP archive.")
+                        st.rerun()
+                    except Exception as exc:
+                        flash_message("error", f"Upload failed: {exc}")
+                        st.rerun()
+            else:
+                st.info(
+                    f"No model names are currently registered for the selected library: "
+                    f"{surrogate_library}"
+                )
 
     st.toggle(
-        "Save uploaded model ZIPs and renewable profile for future iterations",
-        value=st.session_state.get("persist_assets", True),
-        key="persist_assets",
-        help="When enabled, uploaded model archives and normalized renewable profiles are written to disk under user_data/.",
+    "Save uploaded model ZIPs and renewable profile for future iterations",
+    value=st.session_state.get("persist_assets", True),
+    key="persist_assets",
+    help="When enabled, uploaded model archives and normalized renewable profiles are written to disk under user_data/.",
         )
 
     confirm_bundle = st.checkbox(
-        "I confirm that the detected model folders and file sets correspond to the intended surrogate library for this run.",
-            value=not filtered_catalog.empty,)
+    "I confirm that the detected model folders and file sets correspond to the intended surrogate library for this run.",
+        value=not filtered_catalog.empty,)
 
 if not confirm_bundle:
     st.error("Confirm the detected surrogate library bundle in the sidebar to continue.")
