@@ -7,6 +7,108 @@ from typing import Dict, List
 import pandas as pd
 
 
+EMBEDDED_CATALOG = {
+    "libraries": [
+        "variable_h2_constant_co2",
+        "variable_h2_variable_co2",
+    ],
+    "model_order": [
+        "Model_Duty_RTR_Watt",
+        "Model_Duty_FEHE_Watt",
+        "Model_Duty_HX4_Watt",
+        "Model_Duty_HX3_Watt",
+        "Model_Duty_HX1_Watt",
+        "Model_Power_C3_Watt",
+        "Model_Power_C2_Watt",
+        "Model_Power_C1_Watt",
+        "Model_RECLP_CO2",
+        "Model_RECLP_H2",
+        "Model_RECLP_MeOH",
+        "Model_Purge_CO2",
+        "Model_Purge_H2",
+        "Model_Purge_MeOH",
+        "Model_Prod_MeOH",
+    ],
+    "models": {
+        "Model_Duty_RTR_Watt": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "thermal_duty",
+            "unit": "W",
+        },
+        "Model_Duty_FEHE_Watt": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "thermal_duty",
+            "unit": "W",
+        },
+        "Model_Duty_HX4_Watt": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "thermal_duty",
+            "unit": "W",
+        },
+        "Model_Duty_HX3_Watt": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "thermal_duty",
+            "unit": "W",
+        },
+        "Model_Duty_HX1_Watt": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "thermal_duty",
+            "unit": "W",
+        },
+        "Model_Power_C3_Watt": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "electrical_load",
+            "unit": "W",
+        },
+        "Model_Power_C2_Watt": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "electrical_load",
+            "unit": "W",
+        },
+        "Model_Power_C1_Watt": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "electrical_load",
+            "unit": "W",
+        },
+        "Model_RECLP_CO2": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "recycle_stream",
+            "unit": "kmol/h_or_model_unit",
+        },
+        "Model_RECLP_H2": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "recycle_stream",
+            "unit": "kmol/h_or_model_unit",
+        },
+        "Model_RECLP_MeOH": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "recycle_stream",
+            "unit": "kmol/h_or_model_unit",
+        },
+        "Model_Purge_CO2": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "purge_stream",
+            "unit": "kmol/h_or_model_unit",
+        },
+        "Model_Purge_H2": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "purge_stream",
+            "unit": "kmol/h_or_model_unit",
+        },
+        "Model_Purge_MeOH": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "purge_stream",
+            "unit": "kmol/h_or_model_unit",
+        },
+        "Model_Prod_MeOH": {
+            "libraries": ["variable_h2_constant_co2", "variable_h2_variable_co2"],
+            "category": "product_stream",
+            "unit": "t/h_or_model_unit",
+        },
+    },
+}
+
+
 class ModelRegistry:
     def __init__(self, project_root: Path):
         self.project_root = Path(project_root)
@@ -45,8 +147,8 @@ class ModelRegistry:
             try:
                 return json.loads(self.catalog_path.read_text(encoding="utf-8"))
             except Exception:
-                return {}
-        return {}
+                return EMBEDDED_CATALOG
+        return EMBEDDED_CATALOG
 
     def _catalog_library_map(self) -> Dict[str, List[str]]:
         payload = self._load_catalog_payload()
@@ -119,7 +221,16 @@ class ModelRegistry:
         merged: Dict[str, List[str]] = {}
 
         for key in merged_keys:
-            merged[key] = sorted(set(catalog_map.get(key, []) + fs_map.get(key, [])))
+            catalog_models = catalog_map.get(key, [])
+            fs_models = fs_map.get(key, [])
+
+            if catalog_models:
+                ordered = list(catalog_models)
+                extras = sorted([m for m in fs_models if m not in ordered])
+                merged[key] = ordered + extras
+            else:
+                merged[key] = sorted(set(fs_models))
+
         return merged
 
     def get_library_names(self) -> List[str]:
@@ -130,8 +241,7 @@ class ModelRegistry:
 
     def get_models_by_library(self, library_name: str) -> List[str]:
         merged = self._merged_library_map()
-        models = merged.get(str(library_name), [])
-        return sorted(models)
+        return list(merged.get(str(library_name), []))
 
     def _inspect_bundle(self, library_name: str, model_name: str) -> dict:
         bundle_dir = self.models_root / str(library_name) / str(model_name)
