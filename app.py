@@ -992,42 +992,40 @@ with st.sidebar:
             )
             renewable_peak_power_mw = float(active_profile_df["renewable_power_mw"].max())
 
+    st.subheader("Detected Model Bundles")
+
     catalog_df = registry.discover_packages()
     filtered_catalog = (
         catalog_df[catalog_df["library"] == surrogate_library].copy()
         if not catalog_df.empty and "library" in catalog_df.columns
         else pd.DataFrame()
     )
+    if filtered_catalog.empty:
+        st.warning("No configured model names were found for the selected surrogate library.")
+    else:
+        st.dataframe(
+            filtered_catalog[
+                [
+                    "model_name",
+                    "joblib_found",
+                    "py_found",
+                    "txt_found",
+                    "ready_for_runtime",
+                    "ready_for_qa",
+                    "missing_files",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            )
     model_names = registry.get_models_by_library(surrogate_library)
 
-    with st.expander("Upload surrogate model", expanded=False):
-        st.subheader("Detected model bundles")
+    #Victor Alvarez pasted the whole expander "Upload Surrogate Model" from the first version in this section on 09.06.2026
 
-        if filtered_catalog.empty:
-            st.warning(
-                "No configured model names were found for the selected surrogate library."
-            )
-        else:
-            preferred_cols = [
-                "model_name",
-                "joblib_found",
-                "py_found",
-                "txt_found",
-                "ready_for_runtime",
-                "ready_for_qa",
-                "missing_files",
-            ]
-            present_cols = [c for c in preferred_cols if c in filtered_catalog.columns]
-            st.dataframe(
-                filtered_catalog[present_cols],
-                use_container_width=True,
-                hide_index=True,
-            )
-
+    with st.expander("Upload Surrogate Model", expanded=False):
         st.caption(
             "Upload one ZIP per model. The archive is flattened into "
-            "models/packages/<library>/<model>/ so the runtime can find "
-            ".joblib, .py and .txt directly."
+            "models/packages/<library>/<model_name>/ so the runtime can find .joblib, .py and .txt directly."
         )
 
         if model_names:
@@ -1036,25 +1034,14 @@ with st.sidebar:
                 model_names,
                 key=f"target_model_{surrogate_library}",
             )
-
             uploaded_model_zip = st.file_uploader(
                 "Upload model ZIP",
                 type=["zip"],
                 accept_multiple_files=False,
                 key=f"zip_uploader_{surrogate_library}_{target_model_name}",
-                help=(
-                    "Select the ZIP file from your device for the chosen bundle. "
-                    "The uploaded archive will be extracted into the target model folder."
-                ),
             )
 
-            upload_clicked = st.button(
-                "Assign selected model ZIP to model bundle",
-                use_container_width=True,
-                key=f"assign_model_zip_{surrogate_library}_{target_model_name}",
-            )
-
-            if upload_clicked:
+            if st.button("Asign selected model ZIP to model bundle", use_container_width=True):
                 if uploaded_model_zip is None:
                     flash_message("error", "Select a ZIP file before pressing upload.")
                     st.rerun()
@@ -1069,9 +1056,10 @@ with st.sidebar:
                     )
                     flash_message(
                         "success",
-                        f"ZIP extracted into {summary['target_dir']} with "
-                        f"{summary['written_count']} files: "
-                        f"{', '.join(summary['written_files'])}",
+                        (
+                            f"ZIP extracted into {summary['target_dir']} with "
+                            f"{summary['written_count']} file(s): {', '.join(summary['written_files'])}"
+                        ),
                     )
                     st.rerun()
                 except BadZipFile:
@@ -1080,28 +1068,25 @@ with st.sidebar:
                 except Exception as exc:
                     flash_message("error", f"Upload failed: {exc}")
                     st.rerun()
-        else:
-            st.info("No model names are currently registered for the selected library.")
 
-        st.toggle(
-            "Save uploaded model ZIPs and renewable profile for future iterations",
-            value=st.session_state.get("persist_assets", True),
-            key="persist_assets",
-            help="When enabled, uploaded model archives and normalized renewable profiles are written to disk under user_data/.",
+    st.toggle(
+        "Save uploaded model ZIPs and renewable profile for future iterations",
+        value=st.session_state.get("persist_assets", True),
+        key="persist_assets",
+        help="When enabled, uploaded model archives and normalized renewable profiles are written to disk under user_data/.",
         )
 
-        confirm_bundle = st.checkbox(
-            "I confirm that the detected model folders and file sets correspond to the intended surrogate library for this run.",
-            value=not filtered_catalog.empty,
-        )
+    confirm_bundle = st.checkbox(
+        "I confirm that the detected model folders and file sets correspond to the intended surrogate library for this run.",
+            value=not filtered_catalog.empty,)
 
-    if not confirm_bundle:
-        st.error("Confirm the detected surrogate library bundle in the sidebar to continue.")
-        st.stop()
+if not confirm_bundle:
+    st.error("Confirm the detected surrogate library bundle in the sidebar to continue.")
+    st.stop()
 
-    if profile_source != "Synthetic default profile" and active_profile_df is None:
-        st.warning("A renewable profile source was selected, but no active profile is loaded yet.")
-        st.stop()
+if profile_source != "Synthetic default profile" and active_profile_df is None:
+    st.warning("A renewable profile source was selected, but no active profile is loaded yet.")
+    st.stop()
 
 case_payload = {
     "scenario_name": scenario_name,
