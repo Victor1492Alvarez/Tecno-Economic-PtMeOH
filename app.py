@@ -32,6 +32,14 @@ ProgressCallback = Optional[Callable[[str, int, int], None]]
 
 runner = CaseRunner(PROJECT_ROOT)
 registry = ModelRegistry(PROJECT_ROOT)
+st.sidebar.code(
+    f"catalog_path={registry.catalog_path}\n"
+    f"catalog_exists={registry.catalog_path.exists()}\n"
+    f"model_registry_file={ModelRegistry.__module__}\n"
+    f"libraries={registry.get_library_names()}\n"
+    f"models_const={registry.get_models_by_library('variable_h2_constant_co2')[:5]}",
+    language="text",
+)
 
 st.set_page_config(page_title="PtMeOH Sizing Tool V2", layout="wide")
 st.title("PtMeOH Plant Sizing Tool — Version 2")
