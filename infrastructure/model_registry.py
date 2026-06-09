@@ -10,8 +10,35 @@ import pandas as pd
 class ModelRegistry:
     def __init__(self, project_root: Path):
         self.project_root = Path(project_root)
-        self.catalog_path = self.project_root / "catalog.json"
         self.models_root = self.project_root / "models" / "packages"
+        self.catalog_path = self._resolve_catalog_path()
+
+    def _candidate_catalog_paths(self) -> List[Path]:
+        candidates = [
+            self.project_root / "catalog.json",
+            self.project_root / "models" / "catalog.json",
+            self.project_root / "models" / "packages" / "catalog.json",
+            self.project_root.parent / "catalog.json",
+        ]
+        out: List[Path] = []
+        seen: set[str] = set()
+
+        for path in candidates:
+            try:
+                key = str(path.resolve()) if path.exists() else str(path)
+            except Exception:
+                key = str(path)
+            if key not in seen:
+                seen.add(key)
+                out.append(path)
+
+        return out
+
+    def _resolve_catalog_path(self) -> Path:
+        for path in self._candidate_catalog_paths():
+            if path.exists():
+                return path
+        return self.project_root / "catalog.json"
 
     def _load_catalog_payload(self) -> dict:
         if self.catalog_path.exists():
@@ -27,12 +54,6 @@ class ModelRegistry:
         if not isinstance(payload, dict):
             return {}
 
-        # Formato 1:
-        # {
-        #   "libraries": {
-        #       "lib_a": ["m1", "m2"]
-        #   }
-        # }
         if "libraries" in payload and isinstance(payload["libraries"], dict):
             out: Dict[str, List[str]] = {}
             for lib, models in payload["libraries"].items():
@@ -40,57 +61,42 @@ class ModelRegistry:
                     out[str(lib)] = [str(x) for x in models]
                 else:
                     out[str(lib)] = []
-            if out:
-                return out
+            return out
 
-        # Formato 2:
-        # {
-        #   "lib_a": ["m1", "m2"]
-        # }
+        if (
+            isinstance(payload.get("libraries"), list)
+            and isinstance(payload.get("models"), dict)
+        ):
+            out: Dict[str, List[str]] = {str(lib): [] for lib in payload["libraries"]}
+            model_order = payload.get("model_order", [])
+            order_index = (
+                {str(name): idx for idx, name in enumerate(model_order)}
+                if isinstance(model_order, list)
+                else {}
+            )
+
+            for model_name, meta in payload["models"].items():
+                if not isinstance(meta, dict):
+                    continue
+                libraries = meta.get("libraries", [])
+                if not isinstance(libraries, list):
+                    continue
+                for lib in libraries:
+                    lib_key = str(lib)
+                    out.setdefault(lib_key, []).append(str(model_name))
+
+            for lib_key, model_names in out.items():
+                out[lib_key] = sorted(
+                    set(model_names),
+                    key=lambda name: (order_index.get(name, 10**9), name),
+                )
+            return out
+
         out: Dict[str, List[str]] = {}
         for key, value in payload.items():
             if isinstance(value, list):
                 out[str(key)] = [str(x) for x in value]
         if out:
-            return out
-
-        # Formato 3:
-        # {
-        #   "libraries": ["lib_a", "lib_b"],
-        #   "model_order": [...],
-        #   "models": {
-        #       "m1": {"libraries": ["lib_a", "lib_b"]},
-        #       "m2": {"libraries": ["lib_a"]}
-        #   }
-        # }
-        libraries = payload.get("libraries", [])
-        models = payload.get("models", {})
-        model_order = payload.get("model_order", [])
-
-        if isinstance(libraries, list) and isinstance(models, dict):
-            out = {str(lib): [] for lib in libraries}
-
-            for model_name, meta in models.items():
-                if not isinstance(meta, dict):
-                    continue
-                model_libraries = meta.get("libraries", [])
-                if not isinstance(model_libraries, list):
-                    continue
-                for lib in model_libraries:
-                    lib = str(lib)
-                    out.setdefault(lib, []).append(str(model_name))
-
-            if isinstance(model_order, list) and model_order:
-                order_index = {str(name): idx for idx, name in enumerate(model_order)}
-                for lib, model_names in out.items():
-                    out[lib] = sorted(
-                        set(model_names),
-                        key=lambda name: (order_index.get(name, 10**9), name),
-                    )
-            else:
-                for lib, model_names in out.items():
-                    out[lib] = sorted(set(model_names))
-
             return out
 
         return {}
